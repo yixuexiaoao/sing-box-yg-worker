@@ -8,6 +8,8 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
+// 测试中的 sbagent 运行在 127.0.0.1：允许内网地址（线上 Worker 会拒绝，见 validServer）
+globalThis.__SBYG_ALLOW_PRIVATE = true;
 globalThis.__connect = ({ hostname, port }) => {
   const s = net.connect({ host: hostname, port });
   s.on('error', () => {});

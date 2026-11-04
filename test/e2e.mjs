@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import { loadWorker, memoryKV, fakeCtx } from './harness.mjs';
 
 const [agentPy, sbDir] = process.argv.slice(2);
@@ -161,6 +162,25 @@ try {
     const t0 = JSON.parse(await env.SBYG_KV.get('links:' + id)).t;
     await mod.cronTick(env);
     check(/^[0-9a-f]{16}$/.test(rev0) && JSON.parse(await env.SBYG_KV.get('links:' + id)).t === t0, 'links cache stores params rev -> cron does not re-fetch links');
+  }
+
+  // ---------- 服务器地址：只接受公网地址（主机名/内网IP 在 Worker 上无法连接）
+  globalThis.__SBYG_ALLOW_PRIVATE = false;
+  for (const [h, re] of [['free-e2micro', /主机名/], ['10.128.0.2', /内网IP/], ['192.168.1.5', /内网IP/], ['fe80::1', /公网IPv6/]]) {
+    r = await post('/api/servers', { name: 'x', host: h, port: 1234, path: '/p', token: 'x'.repeat(32) });
+    check(r.status === 400 && re.test(r.body.error), 'server host rejected: ' + h);
+  }
+  r = await post('/api/servers', { name: 'gce', host: '34.1.2.3', port: 1234, path: '/p', token: 'x'.repeat(32) });
+  check(r.status === 200, 'public IPv4 accepted');
+  const gceId = r.body.data.find((x) => x.name === 'gce').id;
+  check((await req('DELETE', '/api/servers/' + gceId, undefined, X)).status === 200, 'test server removed');
+  globalThis.__SBYG_ALLOW_PRIVATE = true;
+  {
+    const deadPort = await new Promise((res) => { const sv = net.createServer(); sv.listen(0, '127.0.0.1', () => { const p = sv.address().port; sv.close(() => res(p)); }); });
+    const { callAgent } = mod;
+    let msg = '';
+    try { await callAgent({ host: '127.0.0.1', port: deadPort, path: '/p', token: 'x'.repeat(32) }, 'ping', {}, 5000); } catch (e) { msg = e.message; }
+    check(/无法连接 127\.0\.0\.1:\d+.*安全组/.test(msg), 'unreachable port -> actionable connection error');
   }
 
   // ---------- 订阅

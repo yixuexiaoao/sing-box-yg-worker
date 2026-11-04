@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.2';
+const VERSION = '1.5.3';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -788,7 +788,12 @@ function validServer(s) {
   const host = String(s.host || '').trim().replace(/^\[|\]$/g, '');
   const port = parseInt(s.port, 10);
   const path = String(s.path || '/api').trim();
-  if (!/^[A-Za-z0-9.:-]{1,253}$/.test(host)) throw httpError(400, '服务器地址格式错误');
+  if (!/^[A-Za-z0-9.:-]{1,253}$/.test(host)) throw httpError(400, '服务器地址格式错误：请填写服务器的公网IP或域名');
+  // Worker 只能连接公网地址：IPv4/IPv6 或带点的域名。不带点的主机名（如 VM 名称 free-e2micro）与内网地址在公网上无法连接
+  const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host), v6 = host.includes(':');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && !v4 && !v6 && !host.includes('.')) throw httpError(400, '服务器地址「' + host + '」是主机名，Worker 无法连接：请填写服务器的公网IP或域名（谷歌云在控制台「外部IP」一栏查看）');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v4 && /^(10|127|0|169\.254|192\.168|172\.(1[6-9]|2\d|3[01]))\./.test(host)) throw httpError(400, '「' + host + '」是内网IP，Worker 无法连接：请填写服务器的公网IP（谷歌云/AWS 等网卡上只有内网IP，公网IP在控制台查看）');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v6 && /^(fe80|fc|fd)|^::1?$/i.test(host)) throw httpError(400, '「' + host + '」不是公网IPv6地址');
   if (!(port > 0 && port < 65536) || port === 25) throw httpError(400, '端口错误');
   if (!/^\/[A-Za-z0-9/_-]{0,64}$/.test(path)) throw httpError(400, 'API路径格式错误');
   return {
@@ -1367,7 +1372,12 @@ async function httpPost(host, port, path, body, timeoutMs, openSocket) {
     return await Promise.race([work, timeout]);
   } catch (e) {
     if (e.status) throw e;
-    throw httpError(502, '连接服务器失败：' + (e.message || e));
+    const msg = String((e && e.message) || e);
+    // Cloudflare 的套接字在 TCP 连不上（端口未放行、IP不对、主机名无法解析）时只报这些笼统的错误
+    if (/stream was cancelled|network connection lost|connection refused|connect|socket/i.test(msg)) {
+      throw httpError(502, '无法连接 ' + hostname + ':' + port + '（' + msg + '）：请确认地址是服务器公网IP，VPS防火墙与云平台安全组已放行该TCP端口（谷歌云需在「VPC网络 → 防火墙」放行），且 sbagent 正在运行');
+    }
+    throw httpError(502, '连接服务器失败：' + msg);
   } finally {
     clearTimeout(timer);
     Promise.resolve().then(() => socket.close()).catch(() => { /* 已关闭 */ });

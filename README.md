@@ -117,6 +117,8 @@ node test/dev-server.mjs 8787
 
 ## 常见问题
 
+- **谷歌云 / AWS / Azure**：服务器地址要填控制台中的「外部IP / 公有IP」（网卡上的 10.x 是内网IP）；端口需在平台防火墙放行，谷歌云在「VPC网络 → 防火墙」创建入站规则
+- **连接失败：Stream was cancelled**：Worker 连不上该地址与端口，多为地址填成了主机名/内网IP，或云平台防火墙未放行
 - **连接服务器超时**：检查 IP/端口、VPS 防火墙与云厂商安全组；Cloudflare 不允许 Worker 连接 Cloudflare 自身 IP 段与 25 端口
 - **服务器拒绝请求(404)**：Token 或 API 路径不一致（VPS 上更换过 Token 需在面板编辑同步）、来源IP不在服务器 API 白名单内或已被封禁、VPS 时间误差超过 5 分钟
 - **权限不足**：服务器 API 权限只能在 VPS 上通过 `sb` → 19 → 6 修改；远程升级需选择 4
