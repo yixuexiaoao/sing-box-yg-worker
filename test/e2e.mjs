@@ -21,8 +21,28 @@ for (const [n, l] of [['vl_reality.txt', 'vless://u@1.2.3.4:20001?security=reali
   ['vm_ws.txt', 'vmess://' + Buffer.from(JSON.stringify({ add: '1.2.3.4', ps: 'vm-ws-h', id: 'u' })).toString('base64')]]) {
   fs.writeFileSync(path.join(sbDir, n), l + '\n');
 }
+const fakeShare = path.join(sbDir, '..', 'fake_share.py');
+fs.writeFileSync(fakeShare, [
+  'import json, os, re',
+  'd = os.environ["SB_DIR"]',
+  'cfg = json.loads(re.sub(r"//.*", "", open(os.path.join(d, "sb.json"), encoding="utf-8").read()))',
+  'u = cfg["inbounds"][0]["users"][0]["uuid"]',
+  'open(os.path.join(d, "vl_reality.txt"), "w").write("vless://%s@1.2.3.4:20001?security=reality#vl-reality-h\\n" % u)',
+].join('\n'));
 const env0 = { ...process.env, SB_DIR: sbDir, SB_WEBDIR: path.join(sbDir, '..', 'web'), SB_CMD: path.join(sbDir, 'nope'),
-  SB_BIN: path.join(sbDir, '..', 'sing-box.bat'), PYTHONIOENCODING: 'utf-8' };
+  SB_BIN: path.join(sbDir, '..', 'sing-box.bat'), PYTHONIOENCODING: 'utf-8', SB_SHARE_CMD: 'python -X utf8 "' + fakeShare + '"' };
+// 拦截公开IP库请求（不访问外网），记录调用次数以验证缓存
+const realFetch = globalThis.fetch;
+let geoCalls = 0, geoAsked = [];
+globalThis.fetch = async (u, opt) => {
+  if (String(u).startsWith('http://ip-api.com/batch')) {
+    geoCalls++;
+    const ips = JSON.parse(opt.body);
+    geoAsked.push(...ips);
+    return new Response(JSON.stringify(ips.map((ip) => ({ status: 'success', query: ip, country: '日本', countryCode: 'JP', regionName: '东京都', city: '东京', isp: 'NTT', org: 'NTT Docomo', as: 'AS4713 NTT', mobile: ip.endsWith('.5'), proxy: false, hosting: ip.endsWith('.9') }))));
+  }
+  return realFetch(u, opt);
+};
 const agent = spawn('python', ['-X', 'utf8', agentPy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
 await new Promise((r) => setTimeout(r, 1500));
 
@@ -108,9 +128,9 @@ try {
   cookie = '';
   r = await req('GET', '/sub/' + sub.url.split('/').pop() + '?format=plain');
   const lines = r.body.split('\n');
-  check(r.status === 200 && lines.length === 3 && lines[0].endsWith('#' + encodeURIComponent('测试VPS-vless')) && lines[2] === 'trojan://p@5.6.7.8:443#custom', 'subscription content: filtered protos, renamed, custom (no auth needed)');
+  check(r.status === 200 && lines.length === 3 && lines[0].endsWith('#' + encodeURIComponent('测试VPS-Vless')) && lines[2] === 'trojan://p@5.6.7.8:443#custom', 'subscription content: filtered protos, template names, custom keeps its name (no auth needed)');
   const vm = JSON.parse(Buffer.from(lines[1].slice(8), 'base64').toString());
-  check(vm.ps === '测试VPS-vmess', 'vmess link renamed inside base64 JSON');
+  check(vm.ps === '测试VPS-Vmess', 'vmess link renamed inside base64 JSON');
   r = await req('GET', '/sub/' + sub.url.split('/').pop());
   check(Buffer.from(r.body, 'base64').toString().split('\n').length === 3, 'default format is base64');
   fromIp = '203.0.113.77';
@@ -134,6 +154,68 @@ try {
   r = await call('reset', { items: 'uuid,path,reality' });
   check(r.status === 200 && r.body.data.changed.uuid && fs.readFileSync(path.join(sbDir, 'sb.json'), 'utf8') !== before, 'reset via worker');
   check(JSON.parse(await env.SBYG_KV.get('links:' + id)).t > 0, 'link cache refreshed by reset');
+  const newUuid = r.body.data.changed.uuid;
+  const subTok = (await req('GET', '/api/subs')).body.data[0].url.split('/').pop();
+  const subText = async () => { const c0 = cookie; cookie = ''; const x = await req('GET', '/sub/' + subTok + '?format=plain'); cookie = c0; return x.body; };
+  check((await subText()).includes('vless://' + newUuid + '@'), 'reset from panel -> subscription immediately serves the new UUID');
+  // 模拟在 VPS 上执行重置（菜单18/定时重置/泄露自动重置）：分享链接文件变化，面板事先并不知情
+  fs.writeFileSync(path.join(sbDir, 'vl_reality.txt'), 'vless://vps-side-reset-uuid@1.2.3.4:20001?security=reality#vl-reality-h\n');
+  check(!(await subText()).includes('vps-side-reset-uuid'), 'before cron: subscription still uses cached links');
+  await mod.cronTick(env);
+  check((await subText()).includes('vless://vps-side-reset-uuid@'), 'after cron tick: VPS-side reset synced into subscription');
+  const cacheRev = JSON.parse(await env.SBYG_KV.get('links:' + id)).rev;
+  await mod.cronTick(env);
+  check(JSON.parse(await env.SBYG_KV.get('links:' + id)).rev === cacheRev, 'no refresh when params unchanged');
+
+  // ---------- 订阅节点命名：单独命名、模板、排除、重名、自定义节点
+  r = await req('GET', '/api/subs/nodes?ids=' + id);
+  check(r.status === 200 && r.body.data.length === 3 && r.body.data.every((x) => x.key.startsWith(id + '|') && x.orig), 'subscription node list for editor');
+  const subId = (await req('GET', '/api/subs')).body.data[0].id;
+  r = await post('/api/subs', { id: subId, name: '我的订阅', servers: [id], protos: [], rename: true, tpl: '🇯🇵 {server} {proto} #{n}', custom: 'trojan://p@5.6.7.8:443#custom\ntrojan://q@5.6.7.9:443#second',
+    names: { [id + '|hysteria2']: '东京-高速', 'c|1': '东京-高速' }, exclude: [id + '|vmess-ws'] });
+  check(r.status === 200, 'subscription naming saved');
+  const named = (await subText()).split('\n');
+  const nm = named.map((l) => decodeURIComponent(l.split('#').pop()));
+  check(named.length === 4 && nm[0] === '🇯🇵 测试VPS Vless #1' && nm[1] === '东京-高速' && nm[2] === 'custom' && nm[3] === '东京-高速-2',
+    'per-node names override template, {n} numbering, excluded node removed, custom keeps name, duplicates de-duplicated: ' + JSON.stringify(nm));
+  check(mod.applyTpl('{server}-{proto}-{missing}', { server: 'a', proto: 'b' }) === 'a-b-{missing}', 'template keeps unknown variables');
+
+  // ---------- 服务器分组
+  r = await post('/api/servers', { name: '第二台', host: '127.0.0.2', port: 1234, path: '/x', token: 'y'.repeat(20), group: '香港' });
+  const id2 = r.body.data.find((x) => x.name === '第二台').id;
+  check(r.body.data.find((x) => x.id === id2).group === '香港', 'server group saved');
+  r = await post('/api/servers/group', { ids: [id, id2], group: '亚洲' });
+  check(r.body.data.every((x) => x.group === '亚洲'), 'batch set group');
+  r = await post('/api/groups/rename', { from: '亚洲', to: '亚太' });
+  check(r.body.data.every((x) => x.group === '亚太'), 'rename group');
+  await req('DELETE', '/api/servers/' + id2, undefined, X);
+
+  // ---------- 流量周期
+  const T = (s) => Date.parse(s + 'Z') - 8 * 3600000; // 面板时区 UTC+8 的本地时间
+  let pr = mod.cyclePeriods({ mode: 'month', day: 31 }, T('2026-02-15T10:00:00'), 8);
+  check(pr.cur[0] === T('2026-01-31T00:00:00') && pr.cur[1] === T('2026-02-28T00:00:00') && pr.prev[0] === T('2025-12-31T00:00:00'), 'monthly cycle on day 31 falls back to month end');
+  pr = mod.cyclePeriods({ mode: 'month', day: 1 }, T('2026-11-04T00:00:00'), 8);
+  check(pr.cur[0] === T('2026-11-01T00:00:00') && pr.cur[1] === T('2026-12-01T00:00:00') && pr.prev[0] === T('2026-10-01T00:00:00'), 'monthly cycle on day 1');
+  pr = mod.cyclePeriods({ mode: 'days', len: 30, start: '2026-11-01' }, T('2026-12-01T00:00:01'), 8);
+  check(pr.cur[0] === T('2026-12-01T00:00:00') && pr.prev[0] === T('2026-11-01T00:00:00') && pr.prev[1] === T('2026-12-01T00:00:00'), '30-day cycle: 11-01~11-30, then restarts 12-01');
+  r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', cycle: { mode: 'days', len: 30, start: 'bad' } });
+  check(r.status === 400, 'invalid cycle rejected');
+  r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', cycle: { mode: 'month', day: 1, quotaGB: 1000, alertPct: 80, count: 'max', source: 'nic' } });
+  check(r.status === 200 && r.body.data[0].cycle.count === 'max', 'cycle saved');
+  r = await post('/api/servers/' + id + '/cycle', {});
+  check(r.status === 200 && r.body.data.cur.quota === 1000 * 1073741824 && typeof r.body.data.prev.used === 'number' && r.body.data.cur.start < Date.now(), 'cycle usage computed via agent');
+
+  // ---------- IP 归属地
+  r = await post('/api/geo', { ips: ['203.0.113.5', '203.0.113.9', '127.0.0.1', '10.1.2.3', '198.51.100.20'] });
+  check(r.status === 200 && r.body.data['203.0.113.5'].country === '日本' && r.body.data['203.0.113.5'].mobile && r.body.data['203.0.113.9'].hosting, 'geo lookup with mobile/hosting flags');
+  check(r.body.data['127.0.0.1'].local && r.body.data['10.1.2.3'].local && !geoAsked.includes('127.0.0.1') && !geoAsked.includes('10.1.2.3'), 'private IPs never sent to the public IP database');
+  const calls = geoCalls;
+  r = await post('/api/geo', { ips: ['203.0.113.5', '198.51.100.20'] });
+  check(geoCalls === calls && r.body.data['198.51.100.20'].city === '东京', 'geo results cached in KV');
+  await post('/api/settings', { geo: 'off' });
+  r = await post('/api/geo', { ips: ['192.0.2.200'] });
+  check(geoCalls === calls && !r.body.data['192.0.2.200'], 'geo lookup can be turned off');
+  await post('/api/settings', { geo: 'ipapi' });
 
   // ---------- 审计日志
   r = await req('GET', '/api/audit?limit=100');
@@ -144,7 +226,9 @@ try {
   r = await req('GET', '/api/audit?kind=login&limit=100');
   check(r.body.data.items.every((e) => e.k === 'login'), 'audit filter by kind');
   r = await post('/api/audit/purge', { from: 0, to: Date.now() + 1000 });
-  check(r.status === 200 && r.body.data.deleted > 5, 'audit purge by time range (' + r.body.data.deleted + ')');
+  check(r.status === 403 && /开启二次验证/.test(r.body.error), 'audit purge refused while 2FA not enabled');
+  r = await post('/api/settings', { auditDays: 7 });
+  check(r.status === 403, 'shortening audit retention refused while 2FA not enabled');
 
   // ---------- 设置：校验、TG、登录白名单防自锁
   r = await post('/api/settings', { loginAllow: '10.0.0.0/8' });
@@ -185,6 +269,21 @@ try {
   check((await req('GET', '/api/me')).status === 401, 'logout-all invalidates existing sessions');
   r = await post('/api/login', { password: 'pw-123456', code: await mod.totpCode(secret, Math.floor(Date.now() / 30000)) });
   check(r.status === 200, 'can log in again after logout-all');
+
+  // ---------- 审计日志删除需二次验证
+  const nowCode = () => mod.totpCode(secret, Math.floor(Date.now() / 30000));
+  r = await post('/api/audit/purge', { from: 0, to: Date.now() + 1000, code: '000000' });
+  check(r.status === 403 && /验证码错误/.test(r.body.error), 'audit purge with wrong 2FA code -> 403');
+  r = await post('/api/audit/purge', { from: 0, to: Date.now() + 1000, code: await nowCode() });
+  check(r.status === 200 && r.body.data.deleted > 5, 'audit purge with valid 2FA code (' + r.body.data.deleted + ')');
+  r = await req('GET', '/api/audit?limit=10');
+  check(r.body.data.items.some((e) => e.a === '清理审计日志'), 'the purge itself is recorded');
+  r = await post('/api/settings', { auditDays: 7 });
+  check(r.status === 403, 'shortening retention needs 2FA code');
+  r = await post('/api/settings', { auditDays: 7, totpCode: await nowCode() });
+  check(r.status === 200 && r.body.settings.auditDays === 7, 'shortening retention with 2FA code');
+  r = await post('/api/settings', { auditDays: 60 });
+  check(r.status === 200, 'extending retention needs no code');
 
   // ---------- 导出需要密码
   r = await post('/api/export', { password: 'nope' });
