@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import http from 'node:http';
 import { loadWorker, memoryKV, fakeCtx } from './harness.mjs';
 
 const [agentPy, sbDir] = process.argv.slice(2);
@@ -41,6 +42,11 @@ globalThis.fetch = async (u, opt) => {
     geoAsked.push(...ips);
     return new Response(JSON.stringify(ips.map((ip) => ({ status: 'success', query: ip, country: '日本', countryCode: 'JP', regionName: '东京都', city: '东京', isp: 'NTT', org: 'NTT Docomo', as: 'AS4713 NTT', mobile: ip.endsWith('.5'), proxy: false, hosting: ip.endsWith('.9') }))));
   }
+  if (String(u).startsWith('https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/')) {
+    ghCalls++;
+    const f = String(u).split('/').pop();
+    return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
+  }
   if (String(u).startsWith('https://ipwho.is/')) {
     whoisCalls++;
     const ip = decodeURIComponent(String(u).slice(17).split('?')[0]);
@@ -48,8 +54,16 @@ globalThis.fetch = async (u, opt) => {
   }
   return realFetch(u, opt);
 };
-let whoisCalls = 0;
-const agent = spawn('python', ['-X', 'utf8', agentPy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
+let whoisCalls = 0, ghCalls = 0;
+const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
+fs.copyFileSync(agentPy, agentCopy);
+const upFiles = {};
+const upSrv = http.createServer((q, res) => { const b = upFiles[q.url]; res.writeHead(b ? 200 : 404); res.end(b || ''); });
+await new Promise((r) => upSrv.listen(0, '127.0.0.1', r));
+env0.SB_UPDATE_BASE = 'http://127.0.0.1:' + upSrv.address().port;
+env0.SB_SCRIPT = path.join(sbDir, '..', 'usr_bin_sb');
+fs.writeFileSync(env0.SB_SCRIPT, '#!/bin/bash\n# old\n');
+const agent = spawn('python', ['-X', 'utf8', agentCopy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
 await new Promise((r) => setTimeout(r, 1500));
 
 const env = { ADMIN_PASSWORD: 'pw-123456', SBYG_KV: memoryKV() };
@@ -276,19 +290,27 @@ try {
   cookie = '';
   r = await post('/api/login', { password: 'pw-123456' });
   check(r.status === 401 && r.body.needTotp, 'login asks for TOTP code');
-  r = await post('/api/login', { password: 'pw-123456', code: await mod.totpCode(secret, Math.floor(Date.now() / 30000)) });
+  const freshCode = async () => { await env.SBYG_KV.delete('totp_used'); return mod.totpCode(secret, Math.floor(Date.now() / 30000)); };
+  r = await post('/api/login', { password: 'pw-123456', code });
+  check(r.status === 401 && /已使用/.test(r.body.error), 'TOTP code already used for enabling cannot be reused for login');
+  const loginCode = await freshCode();
+  r = await post('/api/login', { password: 'pw-123456', code: loginCode });
   check(r.status === 200 && cookie, 'login with TOTP');
   const totpCookie = cookie;
+  cookie = '';
+  r = await post('/api/login', { password: 'pw-123456', code: loginCode });
+  check(r.status === 401, 'same TOTP code cannot log in twice (replay)');
+  cookie = totpCookie;
 
   // ---------- 退出所有设备
   r = await post('/api/logout-all', {});
   cookie = totpCookie;
   check((await req('GET', '/api/me')).status === 401, 'logout-all invalidates existing sessions');
-  r = await post('/api/login', { password: 'pw-123456', code: await mod.totpCode(secret, Math.floor(Date.now() / 30000)) });
+  r = await post('/api/login', { password: 'pw-123456', code: await freshCode() });
   check(r.status === 200, 'can log in again after logout-all');
 
   // ---------- 审计日志删除需二次验证
-  const nowCode = () => mod.totpCode(secret, Math.floor(Date.now() / 30000));
+  const nowCode = freshCode;
   r = await post('/api/audit/purge', { from: 0, to: Date.now() + 1000, code: '000000' });
   check(r.status === 403 && /验证码错误/.test(r.body.error), 'audit purge with wrong 2FA code -> 403');
   r = await post('/api/audit/purge', { from: 0, to: Date.now() + 1000, code: await nowCode() });
@@ -301,6 +323,29 @@ try {
   check(r.status === 200 && r.body.settings.auditDays === 7, 'shortening retention with 2FA code');
   r = await post('/api/settings', { auditDays: 60 });
   check(r.status === 200, 'extending retention needs no code');
+
+  // ---------- 升级 sing-box-yg
+  r = await req('GET', '/api/latest');
+  check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
+  const gh = ghCalls;
+  await req('GET', '/api/latest');
+  check(ghCalls === gh, 'latest versions cached');
+  r = await call('status');
+  check(r.status === 200 && 'script_version' in r.body.data, 'status reports script version');
+  const agentSrc = fs.readFileSync(agentCopy, 'utf8');
+  upFiles['/sb.sh'] = '#!/bin/bash\nexport sbrepo="x"\necho new\n';
+  upFiles['/sbagent.py'] = agentSrc.replace(/^VERSION = "[^"]+"/m, 'VERSION = "9.9.9"');
+  upFiles['/version'] = 'v99.1更新内容：\nx\n';
+  r = await call('upgrade');
+  check(r.status === 200 && r.body.data.to.agent === '9.9.9' && r.body.data.to.script === 'v99.1' && fs.readFileSync(env0.SB_SCRIPT, 'utf8').includes('echo new'), 'upgrade via panel replaces files on the server');
+  r = await req('GET', '/api/audit?kind=op&limit=50');
+  check(r.body.data.items.some((e) => e.a === '升级 sing-box-yg' && e.ok), 'upgrade recorded in audit log');
+  // 导入的订阅经过校验：非法令牌重新生成，无效链接整条丢弃
+  r = await post('/api/import', { servers: [], subs: [{ id: 'imp1', name: '导入', token: 'not-hex', custom: ['trojan://a@1.1.1.1:443#x'], servers: [], evil: '<x>' }, { id: 'imp2', name: '坏', custom: ['javascript:alert(1)'] }] });
+  check(r.status === 200 && r.body.data.subs === 1, 'import validates subscriptions');
+  const imp = (await req('GET', '/api/subs')).body.data.find((x) => x.id === 'imp1');
+  check(imp && /^https:\/\/panel\.example\/sub\/[a-f0-9]{32}$/.test(imp.url) && !('evil' in imp), 'imported subscription gets a valid token, unknown fields dropped');
+  check((await req('GET', '/api/me')).body.weakPassword === true, 'weak panel password flagged (<12 chars)');
 
   // ---------- 导出需要密码
   r = await post('/api/export', { password: 'nope' });
@@ -333,6 +378,7 @@ try {
   check(r.status === 429, 'login rate limited after 10 failures');
 } finally {
   agent.kill();
+  upSrv.close();
 }
 console.log('FAILS:', fails);
 process.exit(fails ? 1 : 0);

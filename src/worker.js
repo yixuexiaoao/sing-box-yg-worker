@@ -4,7 +4,9 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
+// 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
+const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
 const LOGIN_MAX_FAIL = 10;
 const COOKIE = '__Host-sbyg_s';
@@ -12,12 +14,12 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const READ_ACTIONS = ['ping', 'status', 'logs', 'stats', 'peers', 'rawlog', 'leakcheck', 'traffic', 'apilog'];
 const ACTIONS = new Set(READ_ACTIONS.concat(['links', 'reset', 'restart', 'logon', 'logoff', 'clearlog', 'logprune',
-  'logpolicy', 'schedule', 'leakconf', 'trafficon', 'trafficoff', 'trafficpurge', 'trafficconf']));
+  'logpolicy', 'schedule', 'leakconf', 'trafficon', 'trafficoff', 'trafficpurge', 'trafficconf', 'upgrade']));
 const ACTION_NAMES = {
   links: '查看节点链接', reset: '重置参数', restart: '重启Sing-box', logon: '开启连接日志', logoff: '关闭连接日志',
   clearlog: '清空日志', logprune: '按时间删除日志', logpolicy: '修改日志策略', schedule: '设置定时重置',
   leakconf: '设置泄露检测', trafficon: '开启流量统计', trafficoff: '关闭流量统计', trafficpurge: '清理流量记录',
-  trafficconf: '修改流量保留天数',
+  trafficconf: '修改流量保留天数', upgrade: '升级 sing-box-yg',
 };
 const TG_EVENTS = {
   login_ok: '登录成功', login_fail: '登录失败/被拒绝', ops: '服务器操作（重置/重启/修改设置）',
@@ -77,7 +79,8 @@ async function route(request, env, ctx) {
 
   const note = (kind, act, extra) => logEvent(env, ctx, settings, who, kind, act, extra);
 
-  if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS });
+  if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS, weakPassword: String(env.ADMIN_PASSWORD).length < 12 });
+  if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1') });
   if (p === '/api/settings' && m === 'POST') {
     const body = await readJson(request);
     const next = sanitizeSettings(body, settings, who.ip);
@@ -466,7 +469,7 @@ async function login(request, env, ctx, who, settings) {
   if (settings.totp) {
     if (!body.code) return json({ ok: false, needTotp: true, error: '请输入二次验证码' }, 401);
     const secret = await env.SBYG_KV.get('totp_secret');
-    if (!secret || !(await totpVerify(secret, String(body.code)))) throw await bad('二次验证码错误');
+    if (!secret || !(await totpVerify(secret, String(body.code), env))) throw await bad('二次验证码错误或已使用');
   }
   const ver = (await env.SBYG_KV.get('sessver')) || '0';
   const ttl = settings.sessionHours * 3600;
@@ -501,7 +504,7 @@ async function requireTotp(env, settings, code, what, note) {
   // 审计日志等敏感数据的删除：必须已开启二次验证且本次提供正确验证码
   if (!settings.totp) throw httpError(403, what + '需要二次验证，请先在「设置 → 安全」中开启二次验证');
   const secret = await env.SBYG_KV.get('totp_secret');
-  if (!secret || !(await totpVerify(secret, String(code || '')))) {
+  if (!secret || !(await totpVerify(secret, String(code || ''), env))) {
     if (note) note('panel', what, { ok: false, msg: '二次验证码错误' });
     throw httpError(403, '二次验证码错误');
   }
@@ -518,7 +521,7 @@ async function totpRoute(op, request, env, settings, note) {
   if (op === 'enable') {
     const secret = await env.SBYG_KV.get('totp_pending');
     if (!secret) throw httpError(400, '请先生成密钥（10分钟内有效）');
-    if (!(await totpVerify(secret, String(body.code || '')))) throw httpError(400, '验证码错误，请检查手机时间');
+    if (!(await totpVerify(secret, String(body.code || ''), env))) throw httpError(400, '验证码错误，请检查手机时间');
     await env.SBYG_KV.put('totp_secret', secret);
     await env.SBYG_KV.delete('totp_pending');
     await env.SBYG_KV.put('settings', JSON.stringify({ ...settings, totp: true }));
@@ -527,7 +530,7 @@ async function totpRoute(op, request, env, settings, note) {
   }
   if (op === 'disable') {
     const secret = await env.SBYG_KV.get('totp_secret');
-    if (!(await passwordOk(env, body.password)) || !secret || !(await totpVerify(secret, String(body.code || '')))) {
+    if (!(await passwordOk(env, body.password)) || !secret || !(await totpVerify(secret, String(body.code || ''), env))) {
       note('panel', '关闭二次验证', { ok: false, msg: '密码或验证码错误' });
       throw httpError(403, '密码或验证码错误');
     }
@@ -574,10 +577,19 @@ export async function totpCode(secret, counter) {
   return String(code).padStart(6, '0');
 }
 
-async function totpVerify(secret, code) {
+// 传入 env 时防重放：同一个验证码（时间片）只能使用一次，被他人看到的验证码在有效期内也无法再用
+async function totpVerify(secret, code, env) {
   if (!/^\d{6}$/.test(code)) return false;
   const c = Math.floor(Date.now() / 30000);
-  for (const d of [-1, 0, 1]) if ((await totpCode(secret, c + d)) === code) return true;
+  for (const d of [-1, 0, 1]) {
+    if ((await totpCode(secret, c + d)) !== code) continue;
+    if (env) {
+      const used = parseInt((await env.SBYG_KV.get('totp_used')) || '0', 10);
+      if (c + d <= used) return false;
+      await env.SBYG_KV.put('totp_used', String(c + d));
+    }
+    return true;
+  }
   return false;
 }
 
@@ -733,13 +745,35 @@ async function importData(env, data) {
   let subs = 0;
   if (data && Array.isArray(data.subs)) {
     const cur = await getSubs(env);
-    for (const s of data.subs) {
-      try { cleanSub(s); } catch (_) { continue; }
-      if (!cur.some((x) => x.id === s.id)) { cur.push(s); subs++; }
+    for (const raw of data.subs.slice(0, 100)) {
+      let v;
+      try { v = cleanSub(raw); } catch (_) { continue; }
+      const id = /^[\w-]{1,36}$/.test(String(raw.id || '')) ? String(raw.id) : crypto.randomUUID().slice(0, 8);
+      if (cur.some((x) => x.id === id) || cur.length >= 100) continue;
+      cur.push({ ...v, id, token: /^[a-f0-9]{32}$/.test(String(raw.token || '')) ? raw.token : randHex(16), created: Number(raw.created) || Date.now(), rotated: Date.now() });
+      subs++;
     }
     await env.SBYG_KV.put('subs', JSON.stringify(cur));
   }
   return { added, updated, subs };
+}
+
+// ------------------------------------------------------------------ 最新版本
+async function latestVersions(env, refresh) {
+  const cached = refresh ? null : await kvJson(env, 'latest', null);
+  if (cached && Date.now() - cached.t < 1800000) return cached;
+  const get = async (f) => {
+    const r = await fetch(UPSTREAM + '/' + f, { headers: { 'user-agent': 'sbyg-worker/' + VERSION } });
+    if (!r.ok) throw httpError(502, '获取 GitHub 版本失败：HTTP ' + r.status);
+    return r.text();
+  };
+  const [ver, agent] = await Promise.all([get('version'), get('sbagent.py')]);
+  const line = (ver.split('\n')[0] || '');
+  const notes = ver.split(/\n(?=v\d)/)[0].split('\n').slice(1).filter((x) => x.trim()).slice(0, 12);
+  const m = agent.match(/^VERSION = "([^"]+)"/m);
+  const out = { t: Date.now(), script: line.split('更新内容')[0].trim(), agent: m ? m[1] : '', notes };
+  await env.SBYG_KV.put('latest', JSON.stringify(out));
+  return out;
 }
 
 // ------------------------------------------------------------------ IP 归属地（公开IP库，结果缓存30天）
@@ -1418,16 +1452,22 @@ function go(tab){S.tab=tab;document.querySelectorAll('#nav [data-tab]').forEach(
 function groupNames(){var g={};S.servers.forEach(function(s){g[s.group||'']=(g[s.group||'']||0)+1});return Object.keys(g).sort(function(a,b){return a===''?1:b===''?-1:(a<b?-1:1)}).map(function(k){return [k,g[k]]})}
 function viewServers(){
  $('view').innerHTML='<div class="bar" style="margin-bottom:8px"><button class="primary" id="b-add">添加服务器</button><button id="b-refresh">全部刷新</button>'+
- '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-io">导入/导出</button><span id="summary" class="muted small"></span></div>'+
+ '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-upg">检查更新</button><button id="b-io">导入/导出</button><span id="summary" class="muted small"></span></div><div id="b-notice"></div>'+
  '<div class="bar tabs" id="gchips" style="margin-bottom:10px"></div><div id="grid"></div>';
  $('b-add').addEventListener('click',function(){editServer()});
  $('b-refresh').addEventListener('click',refreshAll);
  $('b-resetall').addEventListener('click',function(){resetDialog(visibleServers(),true)});
  $('b-batch').addEventListener('click',batchDialog);
  $('b-groups').addEventListener('click',groupsDialog);
+ $('b-upg').addEventListener('click',function(){upgradeDialog()});
+ if(S.me&&S.me.weakPassword)$('b-notice').innerHTML='<div class="card err small" style="margin-bottom:10px">⚠ 当前面板密码 ADMIN_PASSWORD 少于12位，建议在 Cloudflare 后台改为更长的随机密码，并在「设置 → 安全」开启二次验证。</div>';
+ loadLatest().catch(function(){});
  $('b-io').addEventListener('click',ioDialog);
  loadServers();
 }
+function verCmp(a,b){a=String(a||'').replace(/^v/,'').split(/[.-]/).map(Number);b=String(b||'').replace(/^v/,'').split(/[.-]/).map(Number);for(var i=0;i<Math.max(a.length,b.length);i++){var x=a[i]||0,y=b[i]||0;if(x!==y)return x<y?-1:1}return 0}
+function needUpgrade(d){var L=S.latest;return !!(L&&d&&((L.agent&&verCmp(d.agent,L.agent)<0)||(L.script&&d.script_version&&verCmp(d.script_version,L.script)<0)))}
+function loadLatest(force){return api('/api/latest'+(force?'?refresh=1':'')).then(function(j){S.latest=j.data;scheduleRender();return j.data})}
 function visibleServers(){return S.groupFilter==null?S.servers.slice():S.servers.filter(function(s){return (s.group||'')===S.groupFilter})}
 function loadServers(){return api('/api/servers').then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
 var renderPending=false;
@@ -1468,7 +1508,8 @@ function cardHtml(s){
   var tr=d.traffic||{},ap=d.api||{};
   body='<div class="chips">'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+
   '<div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
-  '<span>内核</span><span>sing-box '+esc(d.version||'-')+(d.active?'':' <b class="err">未运行</b>')+' · agent '+esc(d.agent)+'</span>'+
+  '<span>内核</span><span>sing-box '+esc(d.version||'-')+(d.active?'':' <b class="err">未运行</b>')+'</span>'+
+  '<span>版本</span><span>脚本 '+esc(d.script_version||'-')+' · agent '+esc(d.agent)+(needUpgrade(d)?' <span class="chip err">可升级</span> <a data-act="upgrade" data-id="'+esc(s.id)+'">升级</a>':'')+'</span>'+
   '<span>IP</span><span>'+esc(d.server_ip||'-')+'</span>'+
   '<span>运行</span><span>'+fmtUp(d.uptime)+'，负载 '+esc((d.load||[]).join(' '))+(d.mem&&d.mem.MemTotal?'，内存 '+fmtBytes(d.mem.MemTotal-d.mem.MemAvailable)+'/'+fmtBytes(d.mem.MemTotal):'')+'</span>'+
   '<span>日志</span><span>'+(d.log&&d.log.enabled?'已开启 '+fmtBytes(d.log.size)+(d.log.archives?'（归档'+d.log.archives+'份）':''):'<span class="err">未开启</span>')+'</span>'+
@@ -1496,6 +1537,7 @@ function onAction(act,id){
  if(act==='restart'){if(confirm('重启「'+s.name+'」的 Sing-box？'))call(id,'restart').then(function(d){toast(d.active?'重启成功':'重启后未运行，请检查');refreshOne(id)}).catch(function(e){toast(e.message)});return}
  if(act==='traffic'){S.trafficScope='s:'+id;return go('traffic')}
  if(act==='reset')return resetDialog([s]);
+ if(act==='upgrade')return upgradeDialog([id]);
  var f={logs:logsDialog,stats:statsDialog,peers:peersDialog,links:linksDialog,settings:settingsDialog,apilog:apilogDialog}[act];if(f)f(s);
 }
 function editServer(s){
@@ -1530,6 +1572,46 @@ function editServer(s){
   api('/api/servers',{body:body}).then(function(j){S.servers=j.data;var ns=s.id?srvById(s.id):S.servers[S.servers.length-1];closeModal();renderGrid();return refreshOne(ns.id).then(function(){var st=S.status[ns.id];toast(st.error?'已保存，但连接失败：'+st.error:'已保存，连接成功')})})
   .catch(function(e){$('f-err').textContent=e.message});
  });
+}
+// ---------- 升级 sing-box-yg（脚本 sb.sh 与 sbagent）
+function upgradeDialog(preset){
+ modal('检查更新 / 升级 sing-box-yg','<div id="u-latest" class="small"></div><div class="tablewrap" style="margin:8px 0"><table><thead><tr><th><input type="checkbox" id="u-all"></th><th>服务器</th><th>当前脚本</th><th>当前agent</th><th>状态</th></tr></thead><tbody id="u-rows"></tbody></table></div>'+
+ '<div class="bar"><button class="primary" id="u-go">升级所选</button><button id="u-outdated">一键升级全部可升级</button><button id="u-refresh">重新检查</button><span id="u-st" class="small muted"></span></div>'+
+ '<p class="small muted">升级会从 GitHub 仓库下载最新的 sb.sh 与 sbagent.py（HTTPS），校验语法后替换并重启 agent，失败自动回滚；不会重启 Sing-box、不改变节点参数。需要服务器 API 具有「管理」权限；agent 1.3.0 以下需先在VPS上运行 sb 选择 7 升级一次。</p>');
+ var st={};
+ function rowState(s){var x=S.status[s.id];if(!x)return '<span class="muted">未知</span>';if(x.error)return '<span class="err">'+esc(x.error)+'</span>';return needUpgrade(x.data)?'<span class="err">可升级</span>':'<span class="okc">已是最新</span>'}
+ function draw(){var L=S.latest||{};
+  $('u-latest').innerHTML=L.script?'GitHub 最新：脚本 <b>'+esc(L.script)+'</b> · agent <b>'+esc(L.agent)+'</b>'+(L.notes&&L.notes.length?'<details><summary>更新内容</summary><pre class="link" style="white-space:pre-wrap">'+esc(L.notes.join('\\n'))+'</pre></details>':''):'<span class="muted">正在获取 GitHub 最新版本…</span>';
+  $('u-rows').innerHTML=S.servers.map(function(s){var x=S.status[s.id],d=x&&x.data;var chk=preset?preset.indexOf(s.id)>=0:!!(d&&needUpgrade(d));
+   return '<tr><td><input type="checkbox" data-u="'+esc(s.id)+'"'+(chk?' checked':'')+'></td><td>'+esc(s.name)+(s.group?' <span class="small muted">'+esc(s.group)+'</span>':'')+'</td><td>'+esc(d?d.script_version||'-':'-')+'</td><td>'+esc(d?d.agent:'-')+'</td><td id="u-s-'+esc(s.id)+'">'+(st[s.id]||rowState(s))+'</td></tr>'}).join('');
+ }
+ function refresh(force){$('u-st').textContent='检查中…';return Promise.all([loadLatest(force).catch(function(e){$('u-latest').innerHTML='<span class="err">'+esc(e.message)+'</span>'})].concat(S.servers.map(function(s){return refreshOne(s.id)}))).then(function(){$('u-st').textContent='';draw()})}
+ function upgradeOne(s){
+  var cell=function(h){st[s.id]=h;var el=$('u-s-'+s.id);if(el)el.innerHTML=h};
+  cell('升级中…');
+  return call(s.id,'upgrade').then(function(r){
+   var target=r.to.agent;cell('已替换为 '+esc(r.to.script)+' / agent '+esc(target)+'，等待重启…');
+   var t0=Date.now();
+   return new Promise(function(done){(function poll(){setTimeout(function(){call(s.id,'status').then(function(d){
+     if(d.agent===target){S.status[s.id]={data:d};cell('<span class="okc">✔ 已升级到 '+esc(d.script_version)+' / agent '+esc(d.agent)+'</span>');done(true)}
+     else if(Date.now()-t0>90000){cell('<span class="err">重启后版本仍为 '+esc(d.agent)+'，可能已自动回滚，请在VPS上查看</span>');done(false)}else poll();
+    },function(){if(Date.now()-t0>90000){cell('<span class="err">升级后无法连接，请在VPS上检查 sbagent 服务</span>');done(false)}else poll()})},3000)})()});
+  },function(e){cell('<span class="err">'+esc(/未知操作/.test(e.message)?'agent 版本过旧，不支持远程升级：请在VPS上运行 sb 选择 7 升级一次':e.message)+'</span>');return false});
+ }
+ function run(ids){
+  var list=ids.map(srvById).filter(Boolean);if(!list.length)return toast('没有需要升级的服务器');
+  if(!confirm('升级 '+list.length+' 台服务器的 sing-box-yg？'))return;
+  $('u-st').textContent='升级中…';
+  // 分批进行，每批3台，避免同时大量下载与重启
+  var chain=Promise.resolve(),res=[];
+  for(var i=0;i<list.length;i+=3)(function(part){chain=chain.then(function(){return Promise.all(part.map(upgradeOne)).then(function(r){res=res.concat(r)})})})(list.slice(i,i+3));
+  chain.then(function(){var ok=res.filter(Boolean).length;$('u-st').textContent='完成：成功 '+ok+' 台，失败 '+(res.length-ok)+' 台';scheduleRender()});
+ }
+ $('u-all').addEventListener('change',function(){document.querySelectorAll('[data-u]').forEach(function(c){c.checked=checked('u-all')})});
+ $('u-go').addEventListener('click',function(){run(Array.prototype.map.call(document.querySelectorAll('[data-u]:checked'),function(c){return c.getAttribute('data-u')}))});
+ $('u-outdated').addEventListener('click',function(){run(S.servers.filter(function(s){var x=S.status[s.id];return x&&x.data&&needUpgrade(x.data)}).map(function(s){return s.id}))});
+ $('u-refresh').addEventListener('click',function(){refresh(true)});
+ draw();refresh(false);
 }
 function groupsDialog(){
  var groups=groupNames();
