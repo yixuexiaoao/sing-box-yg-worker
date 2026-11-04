@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const GB = 1073741824;
 const LOGIN_MAX_FAIL = 10;
 const COOKIE = '__Host-sbyg_s';
@@ -31,7 +31,7 @@ const DEFAULT_SETTINGS = {
   loginAllow: [],
   totp: false,
   tg: { token: '', chat: '', events: { login_ok: true, login_fail: true, ops: true, panel: true, offline: true, recover: true, daily: false, traffic: true, cycle: true, sub_ip: false } },
-  geo: 'ipapi',
+  geo: 'ipwhois',
   monitor: { enabled: true, failCount: 2 },
   reportHour: 9,
   trafficAlertGB: 0,
@@ -352,6 +352,10 @@ function logEvent(env, ctx, settings, who, kind, act, extra = {}) {
     t: ts, k: kind, a: String(act).slice(0, 40), ip: who.ip, cc: who.cc, ok: extra.ok !== false,
     s: String(extra.srv || '').slice(0, 40), m: String(extra.msg || '').slice(0, 160), u: kind === 'login' ? who.ua.slice(0, 80) : '',
   };
+  while (enc.encode(JSON.stringify(meta)).length > 1000 && (meta.m || meta.u)) {
+    if (meta.u) meta.u = meta.u.slice(0, Math.floor(meta.u.length / 2));
+    else meta.m = meta.m.slice(0, Math.floor(meta.m.length / 2));
+  }
   const ttl = Math.max(60, settings.auditDays * 86400);
   const work = [env.SBYG_KV.put(auditKey(ts), '', { metadata: meta, expirationTtl: ttl })];
   const ev = kind === 'login' ? (meta.ok ? 'login_ok' : 'login_fail') : kind === 'op' ? 'ops' : kind === 'panel' ? 'panel' : '';
@@ -482,6 +486,7 @@ async function checkSession(request, env) {
   } catch (_) {
     return false;
   }
+  if (b64url(sig) !== m[3]) return false; // 只接受规范编码，避免同一签名存在多种写法
   return crypto.subtle.verify('HMAC', await sessionKey(env), sig, enc.encode('sess:' + m[1] + ':' + m[2]));
 }
 
@@ -752,6 +757,7 @@ async function geoLookup(env, ctx, settings, ips) {
   const miss = [];
   const uniq = [...new Set(ips.map((x) => String(x).trim()).filter(Boolean))].slice(0, 300);
   await Promise.all(uniq.map(async (ip) => {
+    if (!parseIp(ip)) return; // 非法输入直接忽略
     if (!isPublicIp(ip)) { out[ip] = { local: true }; return; }
     const c = await kvJson(env, 'geo:' + ip, null);
     if (c) out[ip] = c; else miss.push(ip);
@@ -759,10 +765,12 @@ async function geoLookup(env, ctx, settings, ips) {
   if (!miss.length || settings.geo === 'off') return out;
   const found = {};
   if (settings.geo === 'ipwhois') {
-    await mapLimit(miss.slice(0, 30), 6, async (ip) => {
+    // Worker 单次请求的外部子请求数有限（免费版50），每次最多查询40个，其余由前端分批再请求
+    await mapLimit(miss.slice(0, 40), 8, async (ip) => {
       try {
-        const j = await (await fetch('https://ipwho.is/' + encodeURIComponent(ip) + '?lang=zh-CN')).json();
-        if (j.success) found[ip] = { country: j.country, cc: j.country_code, region: j.region, city: j.city, isp: (j.connection || {}).isp, org: (j.connection || {}).org, as: (j.connection || {}).asn ? 'AS' + j.connection.asn : '', type: j.type };
+        const j = await (await fetch('https://ipwho.is/' + encodeURIComponent(ip) + '?lang=zh-CN&fields=success,country,country_code,region,city,connection')).json();
+        const c = j.connection || {};
+        if (j.success) found[ip] = { country: j.country, cc: j.country_code, region: j.region, city: j.city, isp: c.isp, org: c.org, as: c.asn ? 'AS' + c.asn : '' };
       } catch (_) { /* 查询失败不影响结果 */ }
     });
   } else {
@@ -1363,6 +1371,27 @@ function inputTime(id){var v=val(id);return v?Math.floor(new Date(v).getTime()/1
 function busy(el,text){el.innerHTML='<p class="muted" style="padding:8px">'+(text||'加载中…')+'</p>'}
 function fail(el,e){el.innerHTML='<p class="err" style="padding:8px">'+esc(e.message||e)+'</p>'}
 
+// ================= IP 归属地（所有出现IP的地方共用）
+var GEO={};
+function flag(cc){return cc&&/^[A-Z]{2}$/.test(cc)?String.fromCodePoint(cc.charCodeAt(0)+127397,cc.charCodeAt(1)+127397)+' ':''}
+function geoText(g){if(!g)return '';if(g.local)return '内网/本机';return flag(g.cc)+[g.country,g.region,g.city].filter(function(x,i,a){return x&&a.indexOf(x)===i}).join(' ')}
+function geoIsp(g){return g&&!g.local?(g.isp||g.org||'')+(g.as?' · '+String(g.as).split(' ')[0]:''):''}
+function geoTags(g){if(!g)return '';var t=[];if(g.mobile)t.push('<span class="chip">移动网络</span>');if(g.hosting)t.push('<span class="chip err" title="机房/服务器IP，通常不是个人设备，可能是节点被转用或泄露">机房IP</span>');if(g.proxy)t.push('<span class="chip err">代理/VPN</span>');if(g.local)t.push('<span class="chip">内网/本机</span>');return t.join(' ')}
+// 分批查询（每批100个），已查过的IP不重复请求
+function loadGeo(ips){
+ var need=[];ips.forEach(function(ip){if(ip&&!(ip in GEO)&&need.indexOf(ip)<0)need.push(ip)});
+ need=need.slice(0,1000);
+ var chain=Promise.resolve();
+ for(var i=0;i<need.length;i+=100)(function(part){chain=chain.then(function(){return api('/api/geo',{body:{ips:part}}).then(function(j){Object.keys(j.data).forEach(function(k){GEO[k]=j.data[k]});part.forEach(function(ip){if(!(ip in GEO))GEO[ip]=null})}).catch(function(){})})})(need.slice(i,i+100));
+ return chain;
+}
+function geoSpan(ip){return ip?' <span class="small muted" data-gfor="'+esc(ip)+'"></span>':''}
+function geoFill(root){
+ var els=(root||document).querySelectorAll('[data-gfor]');if(!els.length)return;
+ var ips=Array.prototype.map.call(els,function(e){return e.getAttribute('data-gfor')});
+ loadGeo(ips).then(function(){els.forEach(function(e){var g=GEO[e.getAttribute('data-gfor')];if(!g)return;var t=geoText(g),i=geoIsp(g);e.innerHTML=esc(t)+(i?' · '+esc(i):'')+(g.local?'':' '+geoTags(g))})});
+}
+
 // ================= 登录
 function showLogin(){
  closeModal();
@@ -1527,8 +1556,9 @@ function logsDialog(s,preset){
    if(!d.records.length){out.innerHTML='<p class="muted" style="padding:8px">没有匹配的记录</p>';return}
    out.innerHTML='<table><thead><tr><th>时间</th><th>协议</th><th>源IP</th><th>端口</th><th>访问目标</th><th>网络</th><th>出站</th><th>备注</th></tr></thead><tbody>'+
    d.records.map(function(r){var tgt=r.domain||r.dst||'';var note=(r.domain&&r.dst&&r.domain!==r.dst?'原始目标 '+r.dst+' ':'')+(r.odst?'出站目标 '+r.odst+' ':'')+(r.user?'用户 '+r.user+' ':'');
-    return '<tr><td>'+esc(r.time)+'</td><td>'+esc(r.proto||'')+'</td><td><a data-ip="'+esc(r.src)+'">'+esc(r.src)+'</a>'+(isLocal(r.src)?' <span class="chip">Argo/CDN</span>':'')+'</td><td>'+esc(r.sport)+'</td>'+
+    return '<tr><td>'+esc(r.time)+'</td><td>'+esc(r.proto||'')+'</td><td><a data-ip="'+esc(r.src)+'">'+esc(r.src)+'</a>'+(isLocal(r.src)?' <span class="chip">Argo/CDN</span>':geoSpan(r.src))+'</td><td>'+esc(r.sport)+'</td>'+
     '<td class="wrap">'+(tgt?'<a data-q="'+esc(tgt.replace(/:\\d+$/,''))+'">'+esc(tgt)+'</a>':'')+'</td><td>'+esc(r.net)+'</td><td>'+esc(r.out||'')+'</td><td class="wrap'+(r.err?' err':'')+'">'+esc(r.err||note)+'</td></tr>'}).join('')+'</tbody></table>';
+   geoFill(out);
    bind(out,'a[data-ip]',function(a){$('l-ip').value=a.getAttribute('data-ip');q()});
    bind(out,'a[data-q]',function(a){$('l-q').value=a.getAttribute('data-q');q()});
   }).catch(function(e){fail(out,e)});
@@ -1549,9 +1579,10 @@ function statsDialog(s){
  function draw(){
   var out=$('s-out');if(!data)return;
   if(tab==='ip'){out.innerHTML='<table><thead><tr><th>源IP</th><th>连接数</th><th>失败</th><th>首次</th><th>最近</th><th>协议</th><th>常访问目标</th><th></th></tr></thead><tbody>'+
-   data.ips.map(function(x){return '<tr><td>'+esc(x.ip)+(x.local?' <span class="chip">Argo/CDN</span>':'')+'</td><td>'+x.count+'</td><td'+(x.err?' class="err"':'')+'>'+x.err+'</td><td>'+esc(x.first)+'</td><td>'+esc(x.last)+'</td><td>'+esc(x.protos.join(','))+'</td>'+
+   data.ips.map(function(x){return '<tr><td>'+esc(x.ip)+(x.local?' <span class="chip">Argo/CDN</span>':geoSpan(x.ip))+'</td><td>'+x.count+'</td><td'+(x.err?' class="err"':'')+'>'+x.err+'</td><td>'+esc(x.first)+'</td><td>'+esc(x.last)+'</td><td>'+esc(x.protos.join(','))+'</td>'+
    '<td class="wrap">'+x.top.map(function(t){return esc(t[0])+' ('+t[1]+')'}).join('，')+'</td><td><a data-ip="'+esc(x.ip)+'">明细</a></td></tr>'}).join('')+'</tbody></table>';
    bind(out,'a[data-ip]',function(a){logsDialog(s,{ip:a.getAttribute('data-ip')})});
+   geoFill(out);
   }else{out.innerHTML='<table><thead><tr><th>访问目标</th><th>次数</th><th>来源IP数</th><th>最近访问</th><th></th></tr></thead><tbody>'+
    data.dests.map(function(x){return '<tr><td class="wrap">'+esc(x.host)+'</td><td>'+x.count+'</td><td>'+x.ips+'</td><td>'+esc(x.last)+'</td><td><a data-q="'+esc(x.host)+'">明细</a></td></tr>'}).join('')+'</tbody></table>';
    bind(out,'a[data-q]',function(a){logsDialog(s,{q:a.getAttribute('data-q')})});
@@ -1573,8 +1604,9 @@ function peersDialog(s){
  modal('当前在线客户端 · '+esc(s.name),'<p class="small muted">TCP连接取自 ss，Hysteria2/Tuic(UDP) 取自 conntrack（需系统已加载 nf_conntrack）</p><div class="tablewrap" id="p-out"></div>');
  busy($('p-out'));
  call(s.id,'peers').then(function(d){
-  $('p-out').innerHTML=d.peers.length?'<table><thead><tr><th>源IP</th><th>协议</th><th>连接数</th><th></th></tr></thead><tbody>'+d.peers.map(function(p){return '<tr><td>'+esc(p.ip)+(p.local?' <span class="chip">Argo/CDN</span>':'')+'</td><td>'+esc(p.proto)+'</td><td>'+p.conns+'</td><td><a data-ip="'+esc(p.ip)+'">访问记录</a></td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">当前没有在线客户端</p>';
+  $('p-out').innerHTML=d.peers.length?'<table><thead><tr><th>源IP</th><th>协议</th><th>连接数</th><th></th></tr></thead><tbody>'+d.peers.map(function(p){return '<tr><td>'+esc(p.ip)+(p.local?' <span class="chip">Argo/CDN</span>':geoSpan(p.ip))+'</td><td>'+esc(p.proto)+'</td><td>'+p.conns+'</td><td><a data-ip="'+esc(p.ip)+'">访问记录</a></td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">当前没有在线客户端</p>';
   bind($('p-out'),'a[data-ip]',function(a){logsDialog(s,{ip:a.getAttribute('data-ip')})});
+  geoFill($('p-out'));
  }).catch(function(e){fail($('p-out'),e)});
 }
 
@@ -1662,7 +1694,8 @@ function apilogDialog(s){
  modal('API访问审计日志 · '+esc(s.name),'<p class="small muted">记录服务器API收到的修改操作、权限拒绝、认证失败封禁等（高频只读查询不记录）</p><div class="tablewrap" id="al-out"></div>');
  busy($('al-out'));
  call(s.id,'apilog',{lines:500}).then(function(d){
-  $('al-out').innerHTML=d.entries.length?'<table><thead><tr><th>时间</th><th>来源IP</th><th>操作</th><th>结果</th><th>参数/错误</th></tr></thead><tbody>'+d.entries.map(function(e){return '<tr><td>'+esc(e.time)+'</td><td>'+esc(e.ip)+'</td><td>'+esc(e.action)+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.error||JSON.stringify(e.params||{}))+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">暂无记录</p>';
+  $('al-out').innerHTML=d.entries.length?'<table><thead><tr><th>时间</th><th>来源IP</th><th>操作</th><th>结果</th><th>参数/错误</th></tr></thead><tbody>'+d.entries.map(function(e){return '<tr><td>'+esc(e.time)+'</td><td>'+esc(e.ip)+geoSpan(e.ip)+'</td><td>'+esc(e.action)+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.error||JSON.stringify(e.params||{}))+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">暂无记录</p>';
+  geoFill($('al-out'));
  }).catch(function(e){fail($('al-out'),e)});
 }
 
@@ -1689,7 +1722,8 @@ function batchDialog(){
    var ipm={};rs.forEach(function(r){if(!r.d)return;r.d.ips.forEach(function(x){var o=ipm[x.ip]||(ipm[x.ip]={ip:x.ip,count:0,servers:[]});o.count+=x.count;o.servers.push(r.s.name)})});
    var arr=Object.keys(ipm).map(function(k){return ipm[k]}).sort(function(a,b){return b.count-a.count});
    out.innerHTML=rs.filter(function(r){return r.e}).map(function(r){return '<div class="err small">'+esc(r.s.name)+'：'+esc(r.e.message)+'</div>'}).join('')+
-   '<div class="tablewrap"><table><thead><tr><th>源IP</th><th>连接数</th><th>访问的服务器</th></tr></thead><tbody>'+arr.map(function(x){return '<tr><td>'+esc(x.ip)+'</td><td>'+x.count+'</td><td class="wrap">'+esc(x.servers.join('、'))+'</td></tr>'}).join('')+'</tbody></table></div>';
+   '<div class="tablewrap"><table><thead><tr><th>源IP</th><th>连接数</th><th>访问的服务器</th></tr></thead><tbody>'+arr.map(function(x){return '<tr><td>'+esc(x.ip)+geoSpan(x.ip)+'</td><td>'+x.count+'</td><td class="wrap">'+esc(x.servers.join('、'))+'</td></tr>'}).join('')+'</tbody></table></div>';
+   geoFill(out);
   });
  });
 }
@@ -1711,115 +1745,153 @@ function ioDialog(){
 }
 
 // ================= 流量统计
-var DIMS=[['ip','源IP'],['host','访问地址'],['domain','主域名'],['country','IP归属地'],['isp','运营商/ASN'],['day','日期'],['hour','小时'],['month','月份'],['inbound','入站协议'],['outbound','出站'],['ip_host','源IP+访问地址'],['ip_inbound','源IP+协议']];
+var DIMS=[['ip','源IP'],['host','访问地址'],['domain','主域名'],['country','IP归属地'],['isp','运营商/ASN'],['server','服务器'],['day','日期'],['hour','小时'],['month','月份'],['inbound','入站协议'],['outbound','出站'],['ip_host','源IP+访问地址'],['ip_inbound','源IP+协议']];
 var RANGES=[['today','今天'],['yesterday','昨天'],['24h','最近24小时'],['7d','最近7天'],['30d','最近30天'],['month','本月'],['lastmonth','上月'],['cycle','本流量周期'],['pcycle','上流量周期'],['custom','自定义']];
-var GEO={};
-function flag(cc){return cc&&/^[A-Z]{2}$/.test(cc)?String.fromCodePoint(cc.charCodeAt(0)+127397,cc.charCodeAt(1)+127397)+' ':''}
-function geoText(g){if(!g)return '';if(g.local)return '内网/本机';return flag(g.cc)+[g.country,g.region,g.city].filter(function(x,i,a){return x&&a.indexOf(x)===i}).join(' ')}
-function geoIsp(g){return g&&!g.local?(g.isp||g.org||'')+(g.as?' · '+String(g.as).split(' ')[0]:''):''}
-function geoTags(g){if(!g)return '';var t=[];if(g.mobile)t.push('<span class="chip">移动网络</span>');if(g.hosting)t.push('<span class="chip err" title="机房/服务器IP，通常不是个人设备，可能是节点被转用或泄露">机房IP</span>');if(g.proxy)t.push('<span class="chip err">代理/VPN</span>');if(g.local)t.push('<span class="chip">Argo/CDN/本机</span>');return t.join(' ')}
-function loadGeo(ips){var need=ips.filter(function(ip){return ip&&!(ip in GEO)});if(!need.length)return Promise.resolve();
- return api('/api/geo',{body:{ips:need.slice(0,300)}}).then(function(j){Object.keys(j.data).forEach(function(k){GEO[k]=j.data[k]});need.forEach(function(ip){if(!(ip in GEO))GEO[ip]=null})}).catch(function(){})}
+var MB=1048576;
 function scopeServers(scope){if(!scope)return S.servers.slice();if(scope.indexOf('g:')===0){var g=scope.slice(2);return S.servers.filter(function(s){return (s.group||'')===g})}var s=srvById(scope.slice(2));return s?[s]:[]}
 function viewTraffic(){
  if(!S.servers.length){api('/api/servers').then(function(j){S.servers=j.data;if(j.data.length)viewTraffic();else $('view').innerHTML='<div class="card muted">请先添加服务器</div>'});return}
  var now=Date.now(),groups=groupNames();
  $('view').innerHTML='<div class="card" style="margin-bottom:10px"><div class="bar">'+
- '<select id="t-scope"><option value="">全部服务器</option>'+(groups.length>1?groups.map(function(g){return '<option value="g:'+esc(g[0])+'">分组：'+esc(g[0]||'未分组')+'</option>'}).join(''):'')+
+ '<select id="t-scope" title="统计范围"><option value="">全部服务器</option>'+(groups.length>1?groups.map(function(g){return '<option value="g:'+esc(g[0])+'">分组：'+esc(g[0]||'未分组')+'</option>'}).join(''):'')+
  S.servers.map(function(s){return '<option value="s:'+esc(s.id)+'">'+esc(s.name)+'</option>'}).join('')+'</select>'+
- '<select id="t-range">'+RANGES.map(function(r){return '<option value="'+r[0]+'"'+(r[0]==='24h'?' selected':'')+'>'+r[1]+'</option>'}).join('')+'</select>'+
+ '<select id="t-range">'+RANGES.map(function(r){return '<option value="'+r[0]+'">'+r[1]+'</option>'}).join('')+'</select>'+
  '<span id="t-custom" hidden><input type="datetime-local" id="t-start" value="'+localInput(now-86400000)+'"> 至 <input type="datetime-local" id="t-end" value="'+localInput(now)+'"></span>'+
  '<select id="t-group">'+DIMS.map(function(g){return '<option value="'+g[0]+'">按'+g[1]+'</option>'}).join('')+'</select>'+
  '<select id="t-sort"><option value="bytes">按合计排序</option><option value="up">按上行排序</option><option value="down">按下行排序</option><option value="conns">按连接数排序</option></select>'+
- '<input id="t-ip" placeholder="源IP筛选" size="14"><input id="t-host" placeholder="访问地址筛选" size="14"><input id="t-in" placeholder="协议筛选(如 vless)" size="12">'+
- '<select id="t-limit"><option>50</option><option selected>200</option><option>1000</option></select>'+
- '<button class="primary" id="t-go">查询</button><button id="t-csv">导出CSV</button></div>'+
- '<p class="small muted" style="margin:6px 0 0">点击表格中的项目逐级下钻，用上方路径或「返回上一级」回退。IP归属地来自公开IP库（可在设置中更换或关闭），结果缓存30天。日期/小时按服务器本地时间。</p></div>'+
- '<div class="bar" id="t-crumb" style="margin-bottom:8px"></div><div id="t-sum" style="margin-bottom:10px"></div><div id="t-chart"></div><div class="tablewrap" id="t-out"></div>';
- if(S.trafficScope)$('t-scope').value=S.trafficScope;
- S.trafficScope=null;
+ '<select id="t-limit"><option>50</option><option selected>200</option><option>1000</option></select></div>'+
+ '<div class="bar" style="margin-top:6px"><input id="t-ip" placeholder="源IP" size="16"><input id="t-host" placeholder="访问地址/域名" size="18"><label class="small"><input type="checkbox" id="t-exact">精确匹配</label>'+
+ '<select id="t-in"><option value="">全部协议</option>'+PROTOS.filter(function(p){return p[0]!=='vmess-argo'}).map(function(p){return '<option value="'+p[0]+'">'+p[1]+'</option>'}).join('')+'</select>'+
+ '<select id="t-outb"><option value="">全部出站</option><option value="direct">直连 direct</option><option value="warp">WARP</option><option value="socks">Socks5</option></select>'+
+ '<input id="t-loc" placeholder="归属地/运营商筛选" size="14" title="作用于源IP类结果，如 日本、移动、Google"><input id="t-min" type="number" min="0" placeholder="最少MB" style="width:80px">'+
+ '<label class="small"><input type="checkbox" id="t-split" checked>按服务器分别显示</label>'+
+ '<button class="primary" id="t-go">查询</button><button id="t-reset">重置条件</button><button id="t-csv">导出CSV</button></div>'+
+ '<p class="small muted" style="margin:6px 0 0">点击表格中的项目逐级下钻，用路径或「返回上一级」回退；多台服务器时默认按服务器分别列出，可明确看到同一IP经过哪台服务器访问了哪些地址。IP归属地来自公开IP库，缓存30天。</p></div>'+
+ '<div class="bar" id="t-crumb" style="margin-bottom:8px"></div><div id="t-sum" style="margin-bottom:10px"></div><div id="t-srvsum"></div><div id="t-chart"></div><div class="tablewrap" id="t-out"></div>';
  $('t-range').addEventListener('change',function(){$('t-custom').hidden=val('t-range')!=='custom'});
  $('t-go').addEventListener('click',function(){TS.stack=[{label:'查询',q:readControls()}];runTraffic()});
+ $('t-reset').addEventListener('click',function(){S.lastTrafficQ=null;viewTraffic()});
  $('t-csv').addEventListener('click',exportCsv);
- ['t-ip','t-host','t-in'].forEach(function(id){$(id).addEventListener('keydown',function(e){if(e.key==='Enter')$('t-go').click()})});
- TS.stack=[{label:'查询',q:readControls()}];
+ ['t-ip','t-host','t-loc','t-min'].forEach(function(id){$(id).addEventListener('keydown',function(e){if(e.key==='Enter')$('t-go').click()})});
+ var q=S.lastTrafficQ?JSON.parse(JSON.stringify(S.lastTrafficQ)):{scope:'',range:'24h',group:'ip',sort:'bytes',limit:200,split:true};
+ if(S.trafficScope){q.scope=S.trafficScope;S.trafficScope=null}
+ TS.stack=[{label:'查询',q:q}];
  runTraffic();
 }
 var TS={stack:[],rows:null};
-function readControls(){return {scope:val('t-scope'),range:val('t-range'),cstart:inputTime('t-start'),cend:inputTime('t-end'),group:val('t-group'),sort:val('t-sort'),ip:val('t-ip'),host:val('t-host'),inbound:val('t-in'),limit:Number(val('t-limit'))}}
-function writeControls(q){$('t-scope').value=q.scope;$('t-range').value=q.range;$('t-custom').hidden=q.range!=='custom';if(q.range==='custom'){$('t-start').value=localInput(q.cstart*1000);$('t-end').value=localInput(q.cend*1000)}
- $('t-group').value=q.group;$('t-sort').value=q.sort;$('t-ip').value=q.ip||'';$('t-host').value=q.host||'';$('t-in').value=q.inbound||''}
+function readControls(){return {scope:val('t-scope'),range:val('t-range'),cstart:inputTime('t-start'),cend:inputTime('t-end'),group:val('t-group'),sort:val('t-sort'),limit:Number(val('t-limit')),
+ ip:val('t-ip'),host:val('t-host'),exact:checked('t-exact'),inbound:val('t-in'),outbound:val('t-outb'),loc:val('t-loc'),minmb:Number(val('t-min'))||0,split:checked('t-split')}}
+function writeControls(q){$('t-scope').value=q.scope||'';$('t-range').value=q.range||'24h';$('t-custom').hidden=q.range!=='custom';if(q.range==='custom'&&q.cstart){$('t-start').value=localInput(q.cstart*1000);$('t-end').value=localInput(q.cend*1000)}
+ $('t-group').value=q.group;$('t-sort').value=q.sort||'bytes';$('t-limit').value=String(q.limit||200);$('t-ip').value=q.ip||'';$('t-host').value=q.host||'';$('t-exact').checked=!!q.exact;
+ $('t-in').value=q.inbound&&PROTOS.some(function(p){return p[0]===q.inbound})?q.inbound:'';$('t-outb').value=q.outbound&&['direct','warp','socks'].indexOf(q.outbound)>=0?q.outbound:'';$('t-loc').value=q.loc||'';$('t-min').value=q.minmb||'';$('t-split').checked=q.split!==false}
 function rangeOf(q){
  var now=new Date(),t=Math.floor(now.getTime()/1000),d0=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime()/1000;
  var m0=new Date(now.getFullYear(),now.getMonth(),1).getTime()/1000,lm0=new Date(now.getFullYear(),now.getMonth()-1,1).getTime()/1000;
- var r={today:[d0,t],yesterday:[d0-86400,d0],'24h':[t-86400,t],'7d':[t-7*86400,t],'30d':[t-30*86400,t],month:[m0,t],lastmonth:[lm0,m0],custom:[q.cstart,q.cend]}[q.range];
- if(r)return Promise.resolve(r);
+ var r={today:[d0,t],yesterday:[d0-86400,d0],'24h':[t-86400,t],'7d':[t-7*86400,t],'30d':[t-30*86400,t],month:[m0,t],lastmonth:[lm0,m0],custom:[q.cstart,q.cend]}[q.range||'24h'];
+ if(r){if(!r[0]||!r[1]||r[0]>=r[1])return Promise.reject(new Error('请选择有效的时间范围'));return Promise.resolve(r)}
  var list=scopeServers(q.scope);
  if(list.length!==1||!list[0].cycle||list[0].cycle.mode==='off')return Promise.reject(new Error('「流量周期」需选择单台已设置周期的服务器（在服务器「编辑」中设置）'));
  return api('/api/servers/'+list[0].id+'/cycle',{body:{}}).then(function(j){var p=q.range==='cycle'?j.data.cur:j.data.prev;return [Math.floor(p.start/1000),Math.floor(Math.min(p.end,Date.now())/1000)]});
 }
+// agent 1.2.0 起支持精确筛选与新维度；旧版会忽略这些参数并返回全部数据，必须识别出来，避免把别人的流量算到所选IP上
+var OLD_AGENT='该服务器 sbagent 版本过旧，不支持此查询，请在VPS上运行 sb 选择 7 更新脚本';
+function oldAgent(d,needNew){return needNew&&d&&!('nic' in d)}
 function ipOf(key,group){if(group==='ip')return key;if(group==='ip_host')return key.split(' -> ')[0];if(group==='ip_inbound')return key.split(' · ')[0];return null}
+function agentParams(q,range,group,limit){
+ var p={start:range[0],end:range[1],group:group,sort:q.sort,limit:limit,inbound:q.inbound,outbound:q.outbound,ip_exact:q.ip_exact,host_exact:q.host_exact,domain_exact:q.domain_exact};
+ if(q.exact){if(q.ip&&!p.ip_exact)p.ip_exact=q.ip;if(q.host&&!p.host_exact)p.host_exact=q.host}else{p.ip=q.ip;p.host=q.host}
+ return p;
+}
 function runTraffic(){
  var top=TS.stack[TS.stack.length-1],q=top.q;
+ S.lastTrafficQ=TS.stack[0].q;
  writeControls(q);
  $('t-crumb').innerHTML=(TS.stack.length>1?'<button id="t-back">← 返回上一级</button>':'')+TS.stack.map(function(x,i){return i===TS.stack.length-1?'<b>'+esc(x.label)+'</b>':'<a data-ci="'+i+'">'+esc(x.label)+'</a> ›'}).join(' ');
  if($('t-back'))$('t-back').addEventListener('click',function(){TS.stack.pop();runTraffic()});
  bind($('t-crumb'),'[data-ci]',function(a){TS.stack=TS.stack.slice(0,Number(a.getAttribute('data-ci'))+1);runTraffic()});
- busy($('t-out'),'查询中…');$('t-sum').innerHTML='';$('t-chart').innerHTML='';
- var list=scopeServers(q.scope),geoDim=q.group==='country'||q.group==='isp'||q.country||q.isp;
+ busy($('t-out'),'查询中…');$('t-sum').innerHTML='';$('t-srvsum').innerHTML='';$('t-chart').innerHTML='';
+ var list=scopeServers(q.scope),geoDim=q.group==='country'||q.group==='isp'||!!q.country||!!q.isp;
+ var split=q.split!==false&&list.length>1&&q.group!=='server';
+ var agroup=q.group==='server'?'ip':geoDim?'ip':q.group,alimit=q.group==='server'?1:geoDim?5000:Math.max(q.limit,q.minmb||q.loc?1000:0);
  rangeOf(q).then(function(range){
-  var params={start:range[0],end:range[1],group:geoDim?'ip':q.group,sort:q.sort,ip:q.ip,host:q.host,inbound:q.inbound,outbound:q.outbound,ip_exact:q.ip_exact,host_exact:q.host_exact,domain_exact:q.domain_exact,limit:geoDim?5000:q.limit};
-  return Promise.all(list.map(function(s){return call(s.id,'traffic',params).then(function(d){return{s:s,d:d}},function(e){return{s:s,e:e}})})).then(function(rs){return{rs:rs,range:range}});
+  var params=agentParams(q,range,agroup,alimit);
+  var needNew=params.ip_exact||params.host_exact||params.domain_exact||['domain','month','ip_inbound'].indexOf(agroup)>=0;
+  return Promise.all(list.map(function(s){return call(s.id,'traffic',params).then(function(d){return oldAgent(d,needNew)?{s:s,e:new Error(OLD_AGENT)}:{s:s,d:d}},function(e){return{s:s,e:e}})})).then(function(rs){return{rs:rs,range:range}});
  }).then(function(res){
-  var rows={},tot={up:0,down:0},nic={rx:0,tx:0},mt={up:0,down:0,conns:0},errs=[],off=[];
+  var tot={up:0,down:0},nic={rx:0,tx:0},mt={up:0,down:0,conns:0},errs=[],off=[],per=[];
+  var rows=[],merged={};
   res.rs.forEach(function(r){
-   if(r.e){errs.push(r.s.name+'：'+r.e.message);return}
-   if(!r.d.enabled)off.push(r.s.name);
-   tot.up+=r.d.total.up;tot.down+=r.d.total.down;if(r.d.nic){nic.rx+=r.d.nic.rx;nic.tx+=r.d.nic.tx}
-   mt.up+=r.d.matched.up;mt.down+=r.d.matched.down;mt.conns+=r.d.matched.conns;
-   r.d.rows.forEach(function(x){var o=rows[x.key]||(rows[x.key]={key:x.key,up:0,down:0,conns:0,ips:0,hosts:0,servers:[]});o.up+=x.up;o.down+=x.down;o.conns+=x.conns;o.ips=Math.max(o.ips,x.ips);o.hosts=Math.max(o.hosts,x.hosts);o.servers.push(r.s.name)});
+   if(r.e){errs.push(r.s.name+'：'+r.e.message);per.push({s:r.s,e:r.e});return}
+   var d=r.d;per.push({s:r.s,d:d});
+   if(!d.enabled)off.push(r.s.name);
+   tot.up+=d.total.up;tot.down+=d.total.down;if(d.nic){nic.rx+=d.nic.rx;nic.tx+=d.nic.tx}
+   mt.up+=d.matched.up;mt.down+=d.matched.down;mt.conns+=d.matched.conns;
+   if(q.group==='server'){rows.push({key:r.s.name,srv:r.s,up:d.matched.up,down:d.matched.down,conns:d.matched.conns,ips:'-',hosts:'-',servers:[r.s.name],tzoff:d.tzoff});return}
+   d.rows.forEach(function(x){
+    if(split){rows.push({key:x.key,srv:r.s,up:x.up,down:x.down,conns:x.conns,ips:x.ips,hosts:x.hosts,servers:[r.s.name],first:x.first,last:x.last,tzoff:d.tzoff});return}
+    var o=merged[x.key]||(merged[x.key]={key:x.key,up:0,down:0,conns:0,ips:0,hosts:0,servers:[],tzoff:d.tzoff});o.up+=x.up;o.down+=x.down;o.conns+=x.conns;o.ips=Math.max(o.ips,x.ips);o.hosts=Math.max(o.hosts,x.hosts);o.servers.push(r.s.name);
+   });
   });
-  var arr=Object.keys(rows).map(function(k){return rows[k]});
-  var ips=geoDim||['ip','ip_host','ip_inbound'].indexOf(q.group)>=0?arr.map(function(x){return ipOf(x.key,geoDim?'ip':q.group)}):[];
-  return loadGeo(ips).then(function(){
-   if(q.country)arr=arr.filter(function(x){return geoText(GEO[x.key])===q.country});
-   if(q.isp)arr=arr.filter(function(x){return geoIsp(GEO[x.key])===q.isp});
-   if(q.country||q.isp){mt={up:0,down:0,conns:0};arr.forEach(function(x){mt.up+=x.up;mt.down+=x.down;mt.conns+=x.conns})}
+  if(!split&&q.group!=='server')rows=Object.keys(merged).map(function(k){return merged[k]});
+  var ipCol=geoDim||['ip','ip_host','ip_inbound'].indexOf(q.group)>=0;
+  return loadGeo(ipCol?rows.map(function(x){return ipOf(x.key,geoDim?'ip':q.group)}):[]).then(function(){
+   var gi=function(x){return GEO[ipOf(x.key,geoDim?'ip':q.group)]};
+   if(q.country)rows=rows.filter(function(x){return geoText(gi(x))===q.country});
+   if(q.isp)rows=rows.filter(function(x){return geoIsp(gi(x))===q.isp});
+   if(q.loc&&ipCol){var lw=q.loc.toLowerCase();rows=rows.filter(function(x){var g=gi(x);return (geoText(g)+' '+geoIsp(g)+(g&&g.mobile?' 移动':'')+(g&&g.hosting?' 机房':'')+(g&&g.proxy?' 代理':'')).toLowerCase().indexOf(lw)>=0})}
    if(q.group==='country'||q.group==='isp'){
-    var agg={};arr.forEach(function(x){var g=GEO[x.key],k=q.group==='country'?(geoText(g)||'未知'):(geoIsp(g)||'未知');var o=agg[k]||(agg[k]={key:k,up:0,down:0,conns:0,ips:0,hosts:0,servers:[]});o.up+=x.up;o.down+=x.down;o.conns+=x.conns;o.ips++;o.hosts=Math.max(o.hosts,x.hosts);x.servers.forEach(function(n){if(o.servers.indexOf(n)<0)o.servers.push(n)})});
-    arr=Object.keys(agg).map(function(k){return agg[k]});
+    var agg={};rows.forEach(function(x){var g=gi(x),k=q.group==='country'?(geoText(g)||'未知'):(geoIsp(g)||'未知');var id=(split?x.srv.id+'|':'')+k;
+     var o=agg[id]||(agg[id]={key:k,srv:split?x.srv:null,up:0,down:0,conns:0,ips:0,hosts:0,servers:[]});o.up+=x.up;o.down+=x.down;o.conns+=x.conns;o.ips++;o.hosts=Math.max(o.hosts,x.hosts);x.servers.forEach(function(n){if(o.servers.indexOf(n)<0)o.servers.push(n)})});
+    rows=Object.keys(agg).map(function(k){return agg[k]});
    }
+   if(q.minmb)rows=rows.filter(function(x){return x.up+x.down>=q.minmb*MB});
+   if(q.country||q.isp||q.loc||q.minmb){mt={up:0,down:0,conns:0};rows.forEach(function(x){mt.up+=x.up;mt.down+=x.down;mt.conns+=x.conns})}
    var sk={up:function(x){return x.up},down:function(x){return x.down},conns:function(x){return x.conns}}[q.sort]||function(x){return x.up+x.down};
-   if(q.group==='day'||q.group==='hour'||q.group==='month')arr.sort(function(a,b){return a.key<b.key?-1:1});else arr.sort(function(a,b){return sk(b)-sk(a)});
-   if(arr.length>q.limit)arr=arr.slice(0,q.limit);
-   TS.rows=arr;TS.group=q.group;
-   drawTraffic(arr,q,list,{tot:tot,nic:nic,mt:mt,errs:errs,off:off,range:res.range});
+   if(['day','hour','month'].indexOf(q.group)>=0)rows.sort(function(a,b){return a.key<b.key?-1:a.key>b.key?1:(a.srv&&b.srv&&a.srv.name<b.srv.name?-1:1)});else rows.sort(function(a,b){return sk(b)-sk(a)});
+   var total=rows.length;
+   if(rows.length>q.limit)rows=rows.slice(0,q.limit);
+   TS.rows=rows;TS.group=q.group;TS.split=split;
+   drawTraffic(rows,q,list,{tot:tot,nic:nic,mt:mt,errs:errs,off:off,range:res.range,per:per,total:total,split:split,ipCol:ipCol&&!geoDim||q.group==='ip'});
   });
  }).catch(function(e){fail($('t-out'),e)});
 }
 function drawTraffic(arr,q,list,m){
- $('t-sum').innerHTML='<div class="card"><span class="stat">时间 <b class="small">'+fmtTime(m.range[0]*1000).slice(0,16)+' ~ '+fmtTime(m.range[1]*1000).slice(0,16)+'</b></span><br>'+
+ $('t-sum').innerHTML='<div class="card"><span class="stat">时间 <b class="small">'+fmtTime(m.range[0]*1000).slice(0,16)+' ~ '+fmtTime(m.range[1]*1000).slice(0,16)+'</b></span><span class="stat">范围 <b class="small">'+esc(list.length===1?list[0].name:list.length+' 台服务器')+'</b></span><br>'+
  '<span class="stat">代理总流量 <b>'+fmtBytes(m.tot.up+m.tot.down)+'</b> <span class="small muted">↑'+fmtBytes(m.tot.up)+' ↓'+fmtBytes(m.tot.down)+'</span></span>'+
  (m.nic.rx||m.nic.tx?'<span class="stat">网卡流量 <b>'+fmtBytes(m.nic.rx+m.nic.tx)+'</b> <span class="small muted">出'+fmtBytes(m.nic.tx)+' 入'+fmtBytes(m.nic.rx)+'</span></span>':'')+
- '<span class="stat">筛选结果 <b>'+fmtBytes(m.mt.up+m.mt.down)+'</b></span><span class="stat">连接 <b>'+m.mt.conns+'</b></span>'+
+ '<span class="stat">筛选结果 <b>'+fmtBytes(m.mt.up+m.mt.down)+'</b></span><span class="stat">连接 <b>'+m.mt.conns+'</b></span><span class="stat small muted">共 '+m.total+' 项'+(m.total>arr.length?'，显示前 '+arr.length+' 项':'')+'</span>'+
  (m.errs.length?'<div class="err small">'+esc(m.errs.join('；'))+'</div>':'')+(m.off.length?'<div class="small muted">未开启流量统计：'+esc(m.off.join('、'))+'</div>':'')+'</div>';
- if((q.group==='day'||q.group==='hour'||q.group==='month')&&arr.length)$('t-chart').innerHTML=chart(arr);
+ if(list.length>1&&q.group!=='server'){
+  $('t-srvsum').innerHTML='<div class="tablewrap" style="margin-bottom:10px;max-height:220px"><table><thead><tr><th>服务器</th><th>分组</th><th class="num">代理总流量</th><th class="num">网卡流量</th><th class="num">筛选结果</th><th class="num">连接</th><th></th></tr></thead><tbody>'+
+  m.per.map(function(p){if(p.e)return '<tr><td>'+esc(p.s.name)+'</td><td>'+esc(p.s.group)+'</td><td colspan="5" class="err small">'+esc(p.e.message)+'</td></tr>';var d=p.d;
+   return '<tr><td><a data-scope="'+esc(p.s.id)+'">'+esc(p.s.name)+'</a></td><td>'+esc(p.s.group)+'</td><td class="num">'+fmtBytes(d.total.up+d.total.down)+'</td><td class="num">'+(d.nic?fmtBytes(d.nic.rx+d.nic.tx):'-')+'</td><td class="num"><b>'+fmtBytes(d.matched.up+d.matched.down)+'</b></td><td class="num">'+d.matched.conns+'</td><td class="small muted">'+(d.enabled?'':'未开启统计')+'</td></tr>'}).join('')+'</tbody></table></div>';
+  bind($('t-srvsum'),'a[data-scope]',function(a){var n=JSON.parse(JSON.stringify(q));n.scope='s:'+a.getAttribute('data-scope');TS.stack.push({label:srvById(a.getAttribute('data-scope')).name,q:n});runTraffic()});
+ }
+ if(['day','hour','month'].indexOf(q.group)>=0&&arr.length&&!m.split)$('t-chart').innerHTML=chart(arr);
  var max=arr.reduce(function(mx,x){return Math.max(mx,x.up+x.down)},0)||1;
  var label=DIMS.filter(function(g){return g[0]===q.group})[0][1],ipCol=['ip','ip_host','ip_inbound'].indexOf(q.group)>=0;
- $('t-out').innerHTML=arr.length?'<table><thead><tr><th>'+esc(label)+'</th>'+(ipCol?'<th>归属地</th><th>运营商</th>':'')+'<th class="num">上行</th><th class="num">下行</th><th class="num">合计</th><th>占比</th><th class="num">连接</th><th class="num">IP数</th><th class="num">地址数</th>'+(list.length>1?'<th>服务器</th>':'')+'<th></th></tr></thead><tbody>'+
+ $('t-out').innerHTML=arr.length?'<table><thead><tr>'+(m.split?'<th>服务器</th>':'')+'<th>'+esc(label)+'</th>'+(ipCol?'<th>归属地</th><th>运营商</th>':'')+'<th class="num">上行</th><th class="num">下行</th><th class="num">合计</th><th>占比</th><th class="num">连接</th><th class="num">IP数</th><th class="num">地址数</th>'+(!m.split&&list.length>1?'<th>服务器</th>':'')+'<th></th></tr></thead><tbody>'+
  arr.map(function(x,i){var t=x.up+x.down,ip=ipCol?ipOf(x.key,q.group):null,g=ip?GEO[ip]:null;
-  return '<tr><td class="wrap"><a data-drill="'+i+'">'+esc(x.key)+'</a> '+(ip?geoTags(g):'')+'</td>'+(ipCol?'<td>'+esc(geoText(g))+'</td><td class="wrap small">'+esc(geoIsp(g))+'</td>':'')+
+  return '<tr>'+(m.split?'<td>'+esc(x.srv?x.srv.name:x.servers.join('、'))+(x.srv&&x.srv.group?' <span class="small muted">'+esc(x.srv.group)+'</span>':'')+'</td>':'')+
+  '<td class="wrap"><a data-drill="'+i+'">'+esc(x.key)+'</a> '+(ip?geoTags(g):'')+'</td>'+(ipCol?'<td>'+esc(geoText(g))+'</td><td class="wrap small">'+esc(geoIsp(g))+'</td>':'')+
   '<td class="num">'+fmtBytes(x.up)+'</td><td class="num">'+fmtBytes(x.down)+'</td><td class="num"><b>'+fmtBytes(t)+'</b></td><td><div class="meter"><i style="width:'+Math.max(1,Math.round(t/max*100))+'%"></i></div></td><td class="num">'+x.conns+'</td><td class="num">'+x.ips+'</td><td class="num">'+x.hosts+'</td>'+
-  (list.length>1?'<td class="small">'+esc(x.servers.join('、'))+'</td>':'')+'<td>'+(ip?'<a data-dev="'+esc(ip)+'">设备详情</a>':'')+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">没有数据</p>';
+  (!m.split&&list.length>1?'<td class="small">'+esc(x.servers.join('、'))+'</td>':'')+'<td>'+(ip?'<a data-dev="'+esc(ip)+'">设备详情</a>':'')+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">没有数据</p>';
  bind($('t-out'),'a[data-drill]',function(a){drill(arr[Number(a.getAttribute('data-drill'))],q)});
  bind($('t-out'),'a[data-dev]',function(a){deviceDialog(a.getAttribute('data-dev'),q)});
 }
-function keyRange(key,group){var d=new Date(key.length===7?key+'-01T00:00':key.replace(' ','T')+(key.length===10?'T00:00':'')),s=Math.floor(d.getTime()/1000);
- if(group==='day')return[s,s+86400];if(group==='hour')return[s,s+3600];var n=new Date(d.getFullYear(),d.getMonth()+1,1);return[s,Math.floor(n.getTime()/1000)]}
+// 日期/小时/月份键是服务器本地时间：用该服务器返回的 UTC 偏移换算为时间戳
+function keyRange(key,group,tzoff){
+ var p=key.split(/[- :]/).map(Number),off=Number(tzoff)||0;
+ var y=p[0],mo=(p[1]||1)-1,d=p[2]||1,h=p[3]||0;
+ var s=Date.UTC(y,mo,d,group==='hour'?h:0)/1000-off;
+ if(group==='day')return[s,s+86400];if(group==='hour')return[s,s+3600];
+ return[s,Date.UTC(y,mo+1,1)/1000-off];
+}
 function drill(x,q){
- var n=JSON.parse(JSON.stringify(q)),k=x.key,label;
- var g=q.group;
- if(g==='ip'){n.ip_exact=k;n.group='host';label='IP '+k}
+ var n=JSON.parse(JSON.stringify(q)),k=x.key,label,g=q.group;
+ if(x.srv){n.scope='s:'+x.srv.id}
+ if(g==='server'){n.scope='s:'+x.srv.id;n.group='ip';label=x.srv.name}
+ else if(g==='ip'){n.ip_exact=k;n.group='host';label='IP '+k}
  else if(g==='host'){n.host_exact=k;n.group='ip';label=k}
  else if(g==='domain'){n.domain_exact=k;n.group='host';label=k}
  else if(g==='country'){n.country=k;n.group='ip';label=k}
@@ -1828,12 +1900,14 @@ function drill(x,q){
  else if(g==='outbound'){n.outbound=k;n.group='ip';label='出站 '+k}
  else if(g==='ip_host'){var p=k.split(' -> ');n.ip_exact=p[0];n.host_exact=p[1];n.group='hour';label=k}
  else if(g==='ip_inbound'){var p2=k.split(' · ');n.ip_exact=p2[0];n.inbound=p2[1];n.group='host';label=k}
- else{var r=keyRange(k,g);n.range='custom';n.cstart=r[0];n.cend=r[1];n.group=g==='month'?'day':g==='day'?'hour':'ip_host';label=k}
+ else{var r=keyRange(k,g,x.tzoff);n.range='custom';n.cstart=r[0];n.cend=r[1];n.group=g==='month'?'day':g==='day'?'hour':'ip_host';label=k}
+ if(x.srv&&g!=='server')label=x.srv.name+' · '+label;
  TS.stack.push({label:label,q:n});runTraffic();
 }
 function deviceDialog(ip,q){
+ q=q||{scope:'',range:'7d'};
  var list=scopeServers(q.scope);
- modal('设备详情 · '+esc(ip),'<div id="dv-geo" class="card" style="margin-bottom:10px"></div><div id="dv-out"></div>');
+ modal('设备详情 · '+esc(ip),'<div id="dv-geo" class="card" style="margin-bottom:10px"></div><div id="dv-sum"></div><div id="dv-out"></div>');
  busy($('dv-out'));
  loadGeo([ip]).then(function(){var g=GEO[ip];
   $('dv-geo').innerHTML=g&&!g.local?'<div class="kv"><span>IP</span><span><b>'+esc(ip)+'</b> '+geoTags(g)+'</span><span>归属地</span><span>'+esc(geoText(g))+'</span><span>运营商</span><span>'+esc(g.isp||'-')+'</span><span>组织</span><span>'+esc(g.org||'-')+'</span><span>ASN</span><span>'+esc(g.as||'-')+'</span>'+
@@ -1842,27 +1916,33 @@ function deviceDialog(ip,q){
  });
  rangeOf(q).then(function(range){
   var base={start:range[0],end:range[1],ip_exact:ip},span=range[1]-range[0];
+  $('dv-sum').innerHTML='<p class="small muted">时间：'+fmtTime(range[0]*1000).slice(0,16)+' ~ '+fmtTime(range[1]*1000).slice(0,16)+'</p>';
   return Promise.all(list.map(function(s){
-   return Promise.all([call(s.id,'traffic',Object.assign({group:'host',limit:30},base)),call(s.id,'traffic',Object.assign({group:'inbound',limit:20},base)),
+   return Promise.all([call(s.id,'traffic',Object.assign({group:'host',limit:50},base)),call(s.id,'traffic',Object.assign({group:'inbound',limit:20},base)),
     call(s.id,'traffic',Object.assign({group:span>3*86400?'day':'hour',limit:2000},base)),call(s.id,'peers').catch(function(){return{peers:[]}}),
-    call(s.id,'logs',{ipx:ip,limit:30}).catch(function(){return{records:[]}})]).then(function(r){return{s:s,r:r}},function(e){return{s:s,e:e}});
+    call(s.id,'logs',{ipx:ip,limit:30}).catch(function(){return{records:[]}})]).then(function(r){
+     if(oldAgent(r[0],true))return{s:s,e:new Error(OLD_AGENT)};
+     r[4].records=(r[4].records||[]).filter(function(l){return l.src===ip});return{s:s,r:r}},function(e){return{s:s,e:e}});
   }));
  }).then(function(rs){
-  var html=rs.map(function(x){
-   if(x.e)return '<div class="card err small" style="margin-bottom:8px">'+esc(x.s.name)+'：'+esc(x.e.message)+'</div>';
-   var hosts=x.r[0],protos=x.r[1],tl=x.r[2],peer=x.r[3].peers.filter(function(p){return p.ip===ip})[0],logs=x.r[4].records||[];
-   if(!hosts.matched.conns&&!logs.length&&!peer)return '';
+  var seen=rs.filter(function(x){if(x.e)return true;return x.r[0].matched.conns||x.r[4].records.length||x.r[3].peers.some(function(p){return p.ip===ip})});
+  if(!seen.length){$('dv-out').innerHTML='<p class="muted">所选时间段内该IP在'+(list.length>1?'这些服务器':'该服务器')+'上没有流量或连接记录</p>';return}
+  $('dv-sum').innerHTML+='<div class="tablewrap" style="margin-bottom:10px"><table><thead><tr><th>经由服务器</th><th>分组 / 地址</th><th class="num">流量</th><th class="num">连接</th><th>协议</th><th>最近连接记录</th><th>状态</th></tr></thead><tbody>'+
+  seen.map(function(x){if(x.e)return '<tr><td>'+esc(x.s.name)+'</td><td colspan="6" class="err small">'+esc(x.e.message)+'</td></tr>';
+   var h=x.r[0].matched,peer=x.r[3].peers.filter(function(p){return p.ip===ip})[0],logs=x.r[4].records;
+   return '<tr><td><b>'+esc(x.s.name)+'</b></td><td class="small">'+esc(x.s.group||'-')+' / '+esc(x.s.host)+'</td><td class="num">'+fmtBytes(h.up+h.down)+'</td><td class="num">'+h.conns+'</td><td class="small">'+esc(x.r[1].rows.map(function(p){return p.key}).join('、'))+'</td>'+
+   '<td class="small">'+(logs.length?esc(logs[logs.length-1].time)+' ~ '+esc(logs[0].time):'-')+'</td><td>'+(peer?'<span class="okc">在线 '+peer.conns+'</span>':'离线')+'</td></tr>'}).join('')+'</tbody></table></div>';
+  $('dv-out').innerHTML=seen.map(function(x){
+   if(x.e)return '';
+   var hosts=x.r[0],tl=x.r[2],logs=x.r[4].records||[];
    var hmax=hosts.rows.reduce(function(m,y){return Math.max(m,y.up+y.down)},0)||1;
-   var first=logs.length?logs[logs.length-1].time:'',last=logs.length?logs[0].time:'';
-   return '<div class="card section"><h3>'+esc(x.s.name)+' '+(peer?'<span class="chip okc">在线 '+peer.conns+' 个连接（'+esc(peer.proto)+'）</span>':'<span class="chip">当前离线</span>')+'</h3>'+
-   '<div><span class="stat">流量 <b>'+fmtBytes(hosts.matched.up+hosts.matched.down)+'</b> <span class="small muted">↑'+fmtBytes(hosts.matched.up)+' ↓'+fmtBytes(hosts.matched.down)+'</span></span><span class="stat">连接 <b>'+hosts.matched.conns+'</b></span>'+
-   '<span class="stat">协议 '+protos.rows.map(function(p){return '<span class="chip">'+esc(p.key)+' '+fmtBytes(p.up+p.down)+'</span>'}).join(' ')+'</span></div>'+
-   (logs.length?'<p class="small muted">最近连接记录：'+esc(first)+' ~ '+esc(last)+'，源端口 '+esc(logs.map(function(l){return l.sport}).filter(function(v,i,a){return v&&a.indexOf(v)===i}).slice(0,8).join(', '))+'</p>':'')+
+   return '<div class="card section"><h3>通过「'+esc(x.s.name)+'」（'+esc(x.s.host)+'）访问的地址 <span class="small muted">'+hosts.rows.length+' 个，'+fmtBytes(hosts.matched.up+hosts.matched.down)+'</span></h3>'+
+   (logs.length?'<p class="small muted">源端口：'+esc(logs.map(function(l){return l.sport}).filter(function(v,i,a){return v&&a.indexOf(v)===i}).slice(0,10).join(', '))+'</p>':'')+
    (tl.rows.length?chart(tl.rows):'')+
-   '<div class="tablewrap" style="max-height:260px"><table><thead><tr><th>访问地址</th><th class="num">合计</th><th>占比</th><th class="num">连接</th></tr></thead><tbody>'+hosts.rows.map(function(h){var t=h.up+h.down;return '<tr><td class="wrap">'+esc(h.key)+'</td><td class="num">'+fmtBytes(t)+'</td><td><div class="meter"><i style="width:'+Math.max(1,Math.round(t/hmax*100))+'%"></i></div></td><td class="num">'+h.conns+'</td></tr>'}).join('')+'</tbody></table></div>'+
+   '<div class="tablewrap" style="max-height:280px"><table><thead><tr><th>访问地址</th><th class="num">上行</th><th class="num">下行</th><th class="num">合计</th><th>占比</th><th class="num">连接</th><th>时间</th></tr></thead><tbody>'+hosts.rows.map(function(h){var t=h.up+h.down;
+    return '<tr><td class="wrap">'+esc(h.key)+'</td><td class="num">'+fmtBytes(h.up)+'</td><td class="num">'+fmtBytes(h.down)+'</td><td class="num"><b>'+fmtBytes(t)+'</b></td><td><div class="meter"><i style="width:'+Math.max(1,Math.round(t/hmax*100))+'%"></i></div></td><td class="num">'+h.conns+'</td><td class="small">'+esc(h.first.slice(5,16))+' ~ '+esc(h.last.slice(5,16))+'</td></tr>'}).join('')+'</tbody></table></div>'+
    (logs.length?'<details style="margin-top:6px"><summary class="small">最近 '+logs.length+' 条连接日志</summary><div class="tablewrap" style="max-height:240px"><table><thead><tr><th>时间</th><th>协议</th><th>端口</th><th>目标</th><th>备注</th></tr></thead><tbody>'+logs.map(function(l){return '<tr><td>'+esc(l.time)+'</td><td>'+esc(l.proto||'')+'</td><td>'+esc(l.sport)+'</td><td class="wrap">'+esc(l.domain||l.dst)+'</td><td class="wrap'+(l.err?' err':'')+'">'+esc(l.err||l.out||'')+'</td></tr>'}).join('')+'</tbody></table></div></details>':'')+'</div>';
   }).join('');
-  $('dv-out').innerHTML=html||'<p class="muted">所选时间段内该IP没有流量或连接记录</p>';
  }).catch(function(e){fail($('dv-out'),e)});
 }
 function chart(arr){
@@ -1875,9 +1955,9 @@ function chart(arr){
 }
 function exportCsv(){
  if(!TS.rows||!TS.rows.length)return toast('请先查询');
- var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0;
- var lines=['key,'+(ipCol?'location,isp,':'')+'upload,download,total,conns,ips,hosts'].concat(TS.rows.map(function(x){var ip=ipCol?ipOf(x.key,TS.group):null,g=ip?GEO[ip]:null;
-  return ['"'+String(x.key).replace(/"/g,'""')+'"'].concat(ipCol?['"'+geoText(g).replace(/"/g,'""')+'"','"'+geoIsp(g).replace(/"/g,'""')+'"']:[]).concat([x.up,x.down,x.up+x.down,x.conns,x.ips,x.hosts]).join(',')}));
+ var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0,q=function(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"'};
+ var lines=['server,key,'+(ipCol?'location,isp,':'')+'upload,download,total,conns,ips,hosts'].concat(TS.rows.map(function(x){var ip=ipCol?ipOf(x.key,TS.group):null,g=ip?GEO[ip]:null;
+  return [q(x.srv?x.srv.name:x.servers.join('/')),q(x.key)].concat(ipCol?[q(geoText(g)),q(geoIsp(g))]:[]).concat([x.up,x.down,x.up+x.down,x.conns,x.ips,x.hosts]).join(',')}));
  var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\\ufeff'+lines.join('\\n')],{type:'text/csv'}));a.download='traffic-'+TS.group+'.csv';a.click();
 }
 
@@ -1910,7 +1990,7 @@ function drawSubs(list){
   if(a==='edit')return editSub(s);
   if(a==='rotate'){if(confirm('重置「'+s.name+'」的订阅链接？旧链接立即失效。'))api('/api/subs/'+id+'/rotate',{body:{}}).then(function(j){toast('已重置');drawSubs(j.data)}).catch(function(e){toast(e.message)});return}
   if(a==='del'){if(confirm('删除订阅「'+s.name+'」？'))api('/api/subs/'+id,{method:'DELETE'}).then(function(j){drawSubs(j.data)}).catch(function(e){toast(e.message)});return}
-  if(a==='ips'){var st=s.stat||{ips:[]};modal('订阅访问IP · '+esc(s.name),'<p class="small muted">如出现陌生IP，说明订阅链接可能已泄露，请重置订阅链接，并对相关服务器重置参数。</p><div class="tablewrap"><table><thead><tr><th>IP</th><th>地区</th><th>次数</th><th>首次</th><th>最近</th></tr></thead><tbody>'+st.ips.map(function(x){return '<tr><td>'+esc(x.ip)+'</td><td>'+esc(x.cc)+'</td><td>'+(x.n||1)+'</td><td>'+fmtTime(x.first)+'</td><td>'+fmtTime(x.last)+'</td></tr>'}).join('')+'</tbody></table></div>'+(st.last?'<p class="small muted">最近客户端：'+esc(st.last.ua)+'</p>':''),true);return}
+  if(a==='ips'){var st=s.stat||{ips:[]};modal('订阅访问IP · '+esc(s.name),'<p class="small muted">如出现陌生IP，说明订阅链接可能已泄露，请重置订阅链接，并对相关服务器重置参数。</p><div class="tablewrap"><table><thead><tr><th>IP</th><th>地区</th><th>次数</th><th>首次</th><th>最近</th></tr></thead><tbody>'+st.ips.map(function(x){return '<tr><td>'+esc(x.ip)+geoSpan(x.ip)+'</td><td>'+esc(x.cc)+'</td><td>'+(x.n||1)+'</td><td>'+fmtTime(x.first)+'</td><td>'+fmtTime(x.last)+'</td></tr>'}).join('')+'</tbody></table></div>'+(st.last?'<p class="small muted">最近客户端：'+esc(st.last.ua)+'</p>':''),true);geoFill($('modal'));return}
   if(a==='preview'){modal('节点预览 · '+esc(s.name),'<div id="pv"></div>',true);busy($('pv'));fetch(s.url+'?format=plain',{credentials:'omit'}).then(function(r){return r.text()}).then(function(t){var ls=t.split('\\n').filter(Boolean);$('pv').innerHTML='<p class="small">共 '+ls.length+' 个节点（预览也会计入访问统计）</p>'+ls.map(function(l){return '<div class="link">'+esc(l)+'</div>'}).join('')}).catch(function(e){fail($('pv'),e)})}
  });
 }
@@ -1990,7 +2070,8 @@ function viewAudit(){
    (val('a-from')?'&from='+new Date(val('a-from')).getTime():'')+(val('a-to')?'&to='+new Date(val('a-to')).getTime():'')+(more&&cursor?'&cursor='+encodeURIComponent(cursor):'');
   api('/api/audit?'+qs).then(function(j){items=items.concat(j.data.items);cursor=j.data.cursor;$('a-more').hidden=!cursor;
    $('a-out').innerHTML=items.length?'<table><thead><tr><th>时间</th><th>类型</th><th>操作</th><th>服务器</th><th>IP</th><th>结果</th><th>详情</th></tr></thead><tbody>'+items.map(function(e){
-    return '<tr><td>'+fmtTime(e.t)+'</td><td>'+esc(KINDS[e.k]||e.k)+'</td><td>'+esc(e.a)+'</td><td>'+esc(e.s)+'</td><td>'+esc(e.ip)+' '+esc(e.cc||'')+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.m)+(e.u?' <span class="muted">'+esc(e.u)+'</span>':'')+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">没有记录</p>';
+    return '<tr><td>'+fmtTime(e.t)+'</td><td>'+esc(KINDS[e.k]||e.k)+'</td><td>'+esc(e.a)+'</td><td>'+esc(e.s)+'</td><td>'+(e.ip&&e.ip!=='unknown'?esc(e.ip)+geoSpan(e.ip):'<span class="muted">未知</span>')+(e.cc?' <span class="chip">'+esc(e.cc)+'</span>':'')+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.m)+(e.u?' <span class="muted">'+esc(e.u)+'</span>':'')+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">没有记录</p>';
+  geoFill($('a-out'));
   }).catch(function(e){fail($('a-out'),e)});
  }
  $('a-go').addEventListener('click',function(){q(false)});
@@ -2013,7 +2094,7 @@ function viewSettings(){
   '<div class="field"><span class="small muted">登录有效期（小时）</span><input id="c-sess" type="number" value="'+esc(st.sessionHours)+'"></div>'+
   '<div class="field"><span class="small muted">审计日志保留天数（缩短需二次验证码）</span><input id="c-ad" type="number" value="'+esc(st.auditDays)+'"></div>'+
   '<div class="field"><span class="small muted">二次验证码（缩短保留天数时填写）</span><input id="c-adcode" inputmode="numeric" placeholder="6位验证码"></div>'+
-  '<div class="field"><span class="small muted">IP归属地数据源</span><select id="c-geo"><option value="ipapi">ip-api.com（批量，含移动网络/机房/代理标记，非商业免费）</option><option value="ipwhois">ipwho.is（HTTPS，逐个查询）</option><option value="off">关闭</option></select></div>'+
+  '<div class="field"><span class="small muted">IP归属地数据源</span><select id="c-geo"><option value="ipwhois">ipwho.is（HTTPS 加密传输，推荐）</option><option value="ipapi">ip-api.com（可标记移动网络/机房/代理，但免费版为明文HTTP，IP会以明文发送）</option><option value="off">关闭</option></select></div>'+
   '<div class="field"><span class="small muted">节点缓存刷新间隔（小时）</span><input id="c-lc" type="number" value="'+esc(st.linkCacheHours)+'"></div></div></div>'+
   '<div class="card section"><h3>安全</h3><div class="field"><span class="small muted">登录IP白名单（IP或网段，逗号/换行分隔，留空不限制）。当前IP：'+esc(j.ip)+' '+esc(j.cc)+'</span><textarea id="c-allow" rows="2">'+esc((st.loginAllow||[]).join('\\n'))+'</textarea>'+
   '<span class="small muted">如被锁在外面：在 Cloudflare 后台 KV 中删除 settings 键即可恢复默认设置。</span></div>'+
@@ -2028,7 +2109,7 @@ function viewSettings(){
   '<div class="field"><span class="small muted">每日报告时间（0-23点）</span><input id="c-rh" type="number" value="'+esc(st.reportHour)+'"></div>'+
   '<div class="field"><span class="small muted">单台服务器日流量告警阈值（GB，0关闭）</span><input id="c-ta" type="number" value="'+esc(st.trafficAlertGB)+'"></div></div><div id="c-health" class="small muted"></div></div>'+
   '<button class="primary" id="c-save">保存设置</button> <span id="c-err" class="err small"></span>';
-  $('c-geo').value=st.geo||'ipapi';
+  $('c-geo').value=st.geo||'ipwhois';
   api('/api/health').then(function(h){var ids=Object.keys(h.data);$('c-health').textContent=ids.length?'检测状态：'+ids.map(function(id){var x=h.data[id],s=srvById(id);return (s?s.name:id)+(x.down?' 离线':' 正常')+(x.fails?'(失败'+x.fails+'次)':'')}).join('；'):'尚未运行检测（部署后Cron每5分钟执行）'}).catch(function(){});
   $('c-save').addEventListener('click',function(){
    var events={};document.querySelectorAll('[data-ev]').forEach(function(c){events[c.getAttribute('data-ev')]=c.checked});

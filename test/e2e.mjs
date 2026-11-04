@@ -41,8 +41,14 @@ globalThis.fetch = async (u, opt) => {
     geoAsked.push(...ips);
     return new Response(JSON.stringify(ips.map((ip) => ({ status: 'success', query: ip, country: '日本', countryCode: 'JP', regionName: '东京都', city: '东京', isp: 'NTT', org: 'NTT Docomo', as: 'AS4713 NTT', mobile: ip.endsWith('.5'), proxy: false, hosting: ip.endsWith('.9') }))));
   }
+  if (String(u).startsWith('https://ipwho.is/')) {
+    whoisCalls++;
+    const ip = decodeURIComponent(String(u).slice(17).split('?')[0]);
+    return new Response(JSON.stringify({ success: true, country: '新加坡', country_code: 'SG', region: '新加坡', city: '新加坡', connection: { asn: 16509, org: 'Amazon', isp: 'Amazon.com' }, ip }));
+  }
   return realFetch(u, opt);
 };
+let whoisCalls = 0;
 const agent = spawn('python', ['-X', 'utf8', agentPy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
 await new Promise((r) => setTimeout(r, 1500));
 
@@ -86,8 +92,15 @@ try {
   r = await post('/api/login', { password: 'pw-123456' });
   check(r.status === 200 && cookie.startsWith('__Host-sbyg_s='), 'login sets __Host- session cookie');
   const goodCookie = cookie;
-  cookie = goodCookie.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'));
+  const flip = (c) => (c === 'A' ? 'B' : 'A');
+  cookie = goodCookie.slice(0, -10) + flip(goodCookie.slice(-10, -9)) + goodCookie.slice(-9);
   check((await req('GET', '/api/me')).status === 401, 'tampered cookie rejected');
+  // 末位字符只有4位有效，替换后可能解码为同一签名：必须因编码不规范被拒绝
+  const last = goodCookie.slice(-1), alt = 'AEIMQUYcgkosw048'.includes(last) ? String.fromCharCode(last.charCodeAt(0) + 1) : last;
+  if (alt !== last) {
+    cookie = goodCookie.slice(0, -1) + alt;
+    check((await req('GET', '/api/me')).status === 401, 'non-canonical signature encoding rejected');
+  }
   cookie = '__Host-sbyg_s=9999999999.0.abcde';
   check((await req('GET', '/api/me')).status === 401, 'malformed cookie -> 401');
   cookie = goodCookie;
@@ -206,6 +219,10 @@ try {
   check(r.status === 200 && r.body.data.cur.quota === 1000 * 1073741824 && typeof r.body.data.prev.used === 'number' && r.body.data.cur.start < Date.now(), 'cycle usage computed via agent');
 
   // ---------- IP 归属地
+  r = await post('/api/geo', { ips: ['192.0.2.77', 'not-an-ip', '<script>'] });
+  check(r.status === 200 && whoisCalls === 1 && r.body.data['192.0.2.77'].as === 'AS16509' && !('not-an-ip' in r.body.data) && !('<script>' in r.body.data),
+    'default provider ipwho.is over HTTPS; invalid inputs ignored');
+  await post('/api/settings', { geo: 'ipapi' });
   r = await post('/api/geo', { ips: ['203.0.113.5', '203.0.113.9', '127.0.0.1', '10.1.2.3', '198.51.100.20'] });
   check(r.status === 200 && r.body.data['203.0.113.5'].country === '日本' && r.body.data['203.0.113.5'].mobile && r.body.data['203.0.113.9'].hosting, 'geo lookup with mobile/hosting flags');
   check(r.body.data['127.0.0.1'].local && r.body.data['10.1.2.3'].local && !geoAsked.includes('127.0.0.1') && !geoAsked.includes('10.1.2.3'), 'private IPs never sent to the public IP database');
