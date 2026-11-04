@@ -17,3 +17,7 @@ id = "243b2cc8e56b4aafb0d1793e4b025bda"
 # 登录密码请用机密变量设置，不要写在这里（部署不会覆盖已设置的机密）：
 #   后台：Worker → 设置 → 变量和机密 → 添加机密 ADMIN_PASSWORD
 #   或命令行：npx wrangler secret put ADMIN_PASSWORD
+
+# 定时任务：每5分钟检测服务器离线/恢复、按设置发送每日流量报告与超额告警、刷新订阅用的节点缓存
+[triggers]
+crons = ["*/5 * * * *"]
