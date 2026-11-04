@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const SESSION_TTL = 12 * 3600;
 const LOGIN_MAX_FAIL = 10;
 const enc = new TextEncoder();
@@ -27,7 +27,10 @@ async function route(request, env) {
   const url = new URL(request.url);
   const p = url.pathname;
   if (request.method === 'GET' && (p === '/' || p === '/index.html')) {
-    return new Response(PAGE, { headers: { 'content-type': 'text/html; charset=utf-8', ...SEC_HEADERS } });
+    if (request.headers.get('if-none-match') === PAGE_ETAG) return new Response(null, { status: 304, headers: { etag: PAGE_ETAG } });
+    return new Response(PAGE, {
+      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache', etag: PAGE_ETAG, ...SEC_HEADERS },
+    });
   }
   if (!p.startsWith('/api/')) return new Response('Not Found', { status: 404 });
   if (!env.ADMIN_PASSWORD) throw httpError(500, '未设置 ADMIN_PASSWORD 机密变量，请在 Worker 设置中添加');
@@ -44,13 +47,13 @@ async function route(request, env) {
   if (p === '/api/servers' && request.method === 'GET') {
     return json({ ok: true, data: (await getServers(env)).map(publicServer) });
   }
-  if (p === '/api/servers' && request.method === 'POST') return json({ ok: true, data: await saveServer(env, await request.json()) });
+  if (p === '/api/servers' && request.method === 'POST') return json({ ok: true, data: await saveServer(env, await readJson(request)) });
   if (p === '/api/export' && request.method === 'GET') {
     return new Response(JSON.stringify(await getServers(env), null, 2), {
       headers: { 'content-type': 'application/json', 'content-disposition': 'attachment; filename="sbyg-servers.json"' },
     });
   }
-  if (p === '/api/import' && request.method === 'POST') return json({ ok: true, data: await importServers(env, await request.json()) });
+  if (p === '/api/import' && request.method === 'POST') return json({ ok: true, data: await importServers(env, await readJson(request)) });
   let m = p.match(/^\/api\/servers\/([\w-]+)$/);
   if (m && request.method === 'DELETE') {
     const list = (await getServers(env)).filter((s) => s.id !== m[1]);
@@ -61,10 +64,11 @@ async function route(request, env) {
   if (m && request.method === 'POST') {
     const srv = (await getServers(env)).find((s) => s.id === m[1]);
     if (!srv) throw httpError(404, '服务器不存在');
-    const body = await request.json();
-    if (!ACTIONS.has(body.action)) throw httpError(400, '不支持的操作');
+    const body = await readJson(request);
+    if (!body || !ACTIONS.has(body.action)) throw httpError(400, '不支持的操作');
+    const params = body.params && typeof body.params === 'object' && !Array.isArray(body.params) ? body.params : {};
     const t0 = Date.now();
-    const data = await callAgent(srv, body.action, body.params || {}, body.action === 'reset' ? 300000 : 60000);
+    const data = await callAgent(srv, body.action, params, body.action === 'reset' ? 300000 : 60000);
     return json({ ok: true, data, ms: Date.now() - t0 });
   }
   throw httpError(404, 'not found');
@@ -84,6 +88,14 @@ function json(obj, status = 200, headers = {}) {
   });
 }
 
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch (_) {
+    throw httpError(400, '请求体不是有效的 JSON');
+  }
+}
+
 function httpError(status, message) {
   const e = new Error(message);
   e.status = status;
@@ -101,7 +113,7 @@ async function login(request, env) {
   const failKey = 'fail:' + ip;
   const fails = parseInt((await env.SBYG_KV.get(failKey)) || '0', 10);
   if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '登录失败次数过多，请15分钟后再试');
-  const { password } = await request.json();
+  const { password } = (await readJson(request)) || {};
   const key = await sessionKey(env);
   // 两边都做 HMAC 再比较，避免时序侧信道
   const a = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode('pw:' + String(password || ''))));
@@ -120,8 +132,13 @@ async function login(request, env) {
 async function checkSession(request, env) {
   const m = (request.headers.get('cookie') || '').match(/(?:^|;\s*)sbyg_s=(\d+)\.([\w-]+)/);
   if (!m || parseInt(m[1], 10) < Date.now() / 1000) return false;
-  const key = await sessionKey(env);
-  return crypto.subtle.verify('HMAC', key, b64urlDecode(m[2]), enc.encode('sess:' + m[1]));
+  let sig;
+  try {
+    sig = b64urlDecode(m[2]);
+  } catch (_) {
+    return false;
+  }
+  return crypto.subtle.verify('HMAC', await sessionKey(env), sig, enc.encode('sess:' + m[1]));
 }
 
 function timingSafeEqual(a, b) {
@@ -288,6 +305,7 @@ async function httpPost(host, port, path, body, timeoutMs, openSocket) {
   const timeout = new Promise((_, rej) => {
     timer = setTimeout(() => rej(httpError(504, '连接服务器超时：请检查IP/端口与VPS防火墙')), timeoutMs);
   });
+  work.catch(() => {});
   try {
     return await Promise.race([work, timeout]);
   } catch (e) {
@@ -295,7 +313,7 @@ async function httpPost(host, port, path, body, timeoutMs, openSocket) {
     throw httpError(502, '连接服务器失败：' + (e.message || e));
   } finally {
     clearTimeout(timer);
-    try { socket.close(); } catch (_) { /* 已关闭 */ }
+    Promise.resolve().then(() => socket.close()).catch(() => { /* 已关闭 */ });
   }
 }
 
@@ -478,9 +496,11 @@ function cardHtml(s){
  b('settings','日志/定时/检测')+b('refresh','刷新')+b('restart','重启')+b('edit','编辑')+b('del','删除','danger')+'</div></div>';
 }
 
+var renderPending=false;
+function scheduleRender(){if(renderPending)return;renderPending=true;requestAnimationFrame(function(){renderPending=false;renderGrid()})}
 function refreshOne(id){
  var t0=Date.now();
- return call(id,'status').then(function(d){statusMap[id]={data:d,ms:Date.now()-t0}},function(e){statusMap[id]={error:e.message}}).then(renderGrid);
+ return call(id,'status').then(function(d){statusMap[id]={data:d,ms:Date.now()-t0}},function(e){statusMap[id]={error:e.message}}).then(scheduleRender);
 }
 function refreshAll(){statusMap={};renderGrid();return Promise.all(servers.map(function(s){return refreshOne(s.id)}))}
 
@@ -689,3 +709,10 @@ boot();
 </script>
 </body>
 </html>`;
+
+// 页面内容的 FNV-1a 哈希作为 ETag，页面改动后浏览器自动获取新版本
+const PAGE_ETAG = (() => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < PAGE.length; i++) h = Math.imul(h ^ PAGE.charCodeAt(i), 0x01000193);
+  return '"sbyg-' + (h >>> 0).toString(16) + '"';
+})();

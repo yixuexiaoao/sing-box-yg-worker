@@ -62,8 +62,18 @@ try {
   try { new Function(script); check(true, 'page script parses'); } catch (e) { check(false, 'page script parses: ' + e.message); }
   check(!/\$\{|`/.test(script), 'page script has no template-literal leftovers');
 
+  const pageRes = await worker.fetch(new Request('https://panel.example/'), env);
+  const etag = pageRes.headers.get('etag');
+  const notMod = await worker.fetch(new Request('https://panel.example/', { headers: { 'if-none-match': etag } }), env);
+  check(etag && notMod.status === 304, 'page ETag -> 304 on revalidation');
+
   r = await req('GET', '/api/servers');
   check(r.status === 401, 'unauthenticated -> 401');
+  cookie = 'sbyg_s=9999999999.abcde';
+  check((await req('GET', '/api/me')).status === 401, 'malformed session cookie -> 401 (not 500)');
+  cookie = '';
+  r = await worker.fetch(new Request('https://panel.example/api/login', { method: 'POST', headers: X, body: '{bad' }), env);
+  check(r.status === 400, 'invalid JSON body -> 400');
   r = await req('POST', '/api/login', { password: 'x' });
   check(r.status === 403, 'POST without x-sbyg header -> 403 (CSRF guard)');
   r = await req('POST', '/api/login', { password: 'wrong' }, X);
