@@ -46,6 +46,7 @@ globalThis.fetch = async (u, opt) => {
   if (String(u).startsWith('https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/')) {
     ghCalls++;
     const f = String(u).split('/').pop();
+    if (f === 'sbagent.py') ghRange = (opt && opt.headers && opt.headers.range) || '';
     return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
   }
   if (String(u).startsWith('https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box')) {
@@ -58,7 +59,7 @@ globalThis.fetch = async (u, opt) => {
   }
   return realFetch(u, opt);
 };
-let whoisCalls = 0, ghCalls = 0;
+let whoisCalls = 0, ghCalls = 0, ghRange = '';
 const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
 fs.copyFileSync(agentPy, agentCopy);
 const upFiles = {};
@@ -102,12 +103,19 @@ try {
   let r = await req('GET', '/');
   const csp = r.headers.get('content-security-policy');
   const nonce = (csp.match(/'nonce-([^']+)'/) || [])[1];
-  check(r.status === 200 && nonce && r.body.includes('<script nonce="' + nonce + '">'), 'page served with per-response CSP nonce');
-  check(!/script-src[^;]*unsafe-inline/.test(csp) && !/\son[a-z]+="/i.test(r.body), 'no unsafe-inline scripts, no inline event handlers');
-  const script = r.body.match(/<script[^>]*>([\s\S]*)<\/script>/)[1];
-  try { new Function(script); check(true, 'page script parses'); } catch (e) { check(false, 'page script parses: ' + e.message); }
+  const src = (r.body.match(/<script nonce="([^"]+)" src="(\/app\.[0-9a-f]{8}\.js)"><\/script>/) || []);
+  check(r.status === 200 && nonce && src[1] === nonce, 'page served with per-response CSP nonce (on the external script tag)');
+  check(!/script-src[^;]*unsafe-inline/.test(csp) && !/script-src[^;]*'self'/.test(csp) && !/\son[a-z]+="/i.test(r.body), 'no unsafe-inline scripts, no inline event handlers');
+  check(r.body.length < 12000 && !/<script[^>]*>[^<]/.test(r.body), 'HTML shell is small and has no inline script (' + r.body.length + ' bytes)');
+  const js = await req('GET', src[2]);
+  check(js.status === 200 && /javascript/.test(js.headers.get('content-type')) && js.headers.get('x-content-type-options') === 'nosniff' &&
+    /immutable/.test(js.headers.get('cache-control')), 'app script served with long-term immutable caching');
+  try { new Function(js.body); check(js.body.length > 50000, 'page script parses'); } catch (e) { check(false, 'page script parses: ' + e.message); }
+  const stale = await req('GET', '/app.00000000.js');
+  check(stale.status === 200 && stale.headers.get('cache-control') === 'no-store', 'unknown script hash (deploy race) served uncached');
+  check((await req('GET', '/app.zz.js')).status === 404, 'malformed script path -> 404');
   const r2 = await req('GET', '/');
-  check(r2.headers.get('content-security-policy') !== csp, 'nonce differs per response');
+  check(r2.headers.get('content-security-policy') !== csp && r2.body.includes('src="' + src[2] + '"'), 'nonce differs per response, script URL stable');
 
   // ---------- 登录与会话
   check((await req('GET', '/api/servers')).status === 401, 'unauthenticated -> 401');
@@ -366,9 +374,18 @@ try {
   r = await req('GET', '/api/latest');
   check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
   check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
+  check(ghRange === 'bytes=0-8191', 'only the head of sbagent.py is fetched for its version');
   const gh = ghCalls;
   await req('GET', '/api/latest');
   check(ghCalls === gh, 'latest versions cached');
+  {
+    // 缓存过期：立即返回旧数据，后台刷新后更新缓存
+    const old = JSON.parse(await env.SBYG_KV.get('latest'));
+    await env.SBYG_KV.put('latest', JSON.stringify({ ...old, t: Date.now() - 3600000, script: 'v-old' }));
+    r = await req('GET', '/api/latest');
+    const fresh = JSON.parse(await env.SBYG_KV.get('latest'));
+    check(r.body.data.script === 'v-old' && ghCalls > gh && fresh.script === 'v99.1' && Date.now() - fresh.t < 60000, 'stale latest versions served at once, refreshed in background');
+  }
   r = await call('status');
   check(r.status === 200 && 'script_version' in r.body.data, 'status reports script version');
   const agentSrc = fs.readFileSync(agentCopy, 'utf8');

@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.3';
+const VERSION = '1.5.4';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -60,6 +60,7 @@ async function route(request, env, ctx) {
   const p = url.pathname;
   const m = request.method;
   if (m === 'GET' && (p === '/' || p === '/index.html')) return page();
+  if (m === 'GET' && /^\/app\.[0-9a-f]{8}\.js$/.test(p)) return appScript(p);
   if (m === 'GET' && p.startsWith('/sub/')) return serveSub(request, env, ctx, p.slice(5));
   if (!p.startsWith('/api/')) return new Response('Not Found', { status: 404 });
   if (!env.ADMIN_PASSWORD) throw httpError(500, '未设置 ADMIN_PASSWORD 机密变量，请在 Worker 设置中添加');
@@ -70,17 +71,18 @@ async function route(request, env, ctx) {
     if (request.headers.get('x-sbyg') !== '1' || (origin && origin !== url.origin)) throw httpError(403, 'forbidden');
   }
   const who = { ip: clientIp(request), cc: (request.cf && request.cf.country) || '', ua: (request.headers.get('user-agent') || '').slice(0, 100) };
-  const settings = await getSettings(env);
+  // 设置与会话校验各需读取一次 KV：并行进行
+  const [settings, authed] = await Promise.all([getSettings(env), checkSession(request, env)]);
 
   if (p === '/api/pre') return json({ ok: true, title: settings.title, totp: !!settings.totp });
   if (p === '/api/login' && m === 'POST') return login(request, env, ctx, who, settings);
   if (p === '/api/logout' && m === 'POST') return json({ ok: true }, 200, { 'set-cookie': COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' });
-  if (!(await checkSession(request, env))) throw httpError(401, '未登录或登录已过期');
+  if (!authed) throw httpError(401, '未登录或登录已过期');
 
   const note = (kind, act, extra) => logEvent(env, ctx, settings, who, kind, act, extra);
 
   if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS, weakPassword: String(env.ADMIN_PASSWORD).length < 12, dataEncrypted: !!env.DATA_KEY, secretError: await secretProblem(env, settings) });
-  if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1') });
+  if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1', ctx) });
   if (p === '/api/settings' && m === 'POST') {
     const body = await readJson(request);
     const next = sanitizeSettings(body, settings, who.ip);
@@ -102,7 +104,7 @@ async function route(request, env, ctx) {
   }
   if (p.startsWith('/api/totp/') && m === 'POST') return totpRoute(p.slice(10), request, env, settings, note);
 
-  if (p === '/api/servers' && m === 'GET') return json({ ok: true, data: (await getServers(env)).map(publicServer) });
+  if (p === '/api/servers' && m === 'GET') return json({ ok: true, data: (await getServers(env, false)).map(publicServer) });
   if (p === '/api/servers' && m === 'POST') {
     const body = await readJson(request);
     const data = await saveServer(env, body);
@@ -130,7 +132,7 @@ async function route(request, env, ctx) {
     const body = (await readJson(request)) || {};
     const group = String(body.group || '').trim().slice(0, 32);
     const ids = Array.isArray(body.ids) ? body.ids : [];
-    const list = await getServers(env);
+    const list = await getServers(env, false);
     list.forEach((s) => { if (ids.includes(s.id)) s.group = group; });
     await putServers(env, list);
     note('panel', '设置服务器分组', { ok: true, msg: (group || '未分组') + ' · ' + ids.length + ' 台' });
@@ -139,7 +141,7 @@ async function route(request, env, ctx) {
   if (p === '/api/groups/rename' && m === 'POST') {
     const body = (await readJson(request)) || {};
     const from = String(body.from || ''), to = String(body.to || '').trim().slice(0, 32);
-    const list = await getServers(env);
+    const list = await getServers(env, false);
     list.forEach((s) => { if ((s.group || '') === from) s.group = to; });
     await putServers(env, list);
     note('panel', '重命名分组', { ok: true, msg: (from || '未分组') + ' → ' + (to || '未分组') });
@@ -155,13 +157,11 @@ async function route(request, env, ctx) {
   }
   let mm = p.match(/^\/api\/servers\/([\w-]+)\/cycle$/);
   if (mm && m === 'POST') {
-    const srv = (await getServers(env)).find((s) => s.id === mm[1]);
-    if (!srv) throw httpError(404, '服务器不存在');
-    return json({ ok: true, data: await serverCycle(srv, settings, Date.now()) });
+    return json({ ok: true, data: await serverCycle(await getServer(env, mm[1]), settings, Date.now()) });
   }
   mm = p.match(/^\/api\/servers\/([\w-]+)$/);
   if (mm && m === 'DELETE') {
-    const list = await getServers(env);
+    const list = await getServers(env, false);
     const srv = list.find((s) => s.id === mm[1]);
     await putServers(env, list.filter((s) => s.id !== mm[1]));
     await env.SBYG_KV.delete('links:' + mm[1]);
@@ -170,8 +170,7 @@ async function route(request, env, ctx) {
   }
   mm = p.match(/^\/api\/servers\/([\w-]+)\/call$/);
   if (mm && m === 'POST') {
-    const srv = (await getServers(env)).find((s) => s.id === mm[1]);
-    if (!srv) throw httpError(404, '服务器不存在');
+    const srv = await getServer(env, mm[1]);
     const body = await readJson(request);
     if (!body || !ACTIONS.has(body.action)) throw httpError(400, '不支持的操作');
     const params = body.params && typeof body.params === 'object' && !Array.isArray(body.params) ? body.params : {};
@@ -279,9 +278,17 @@ function randHex(n) {
 }
 
 async function mapLimit(items, limit, fn) {
-  // Worker 单次请求同时打开的出站连接有限，分批并发
-  const out = [];
-  for (let i = 0; i < items.length; i += limit) out.push(...(await Promise.all(items.slice(i, i + limit).map(fn))));
+  // Worker 单次请求同时打开的出站连接有限：最多 limit 个同时进行，完成一个立即开始下一个
+  // （原先按批等待：一批中有一台慢或超时，同批其余连接空闲也要等它结束）
+  const out = new Array(items.length);
+  let next = 0;
+  const run = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
   return out;
 }
 
@@ -440,9 +447,14 @@ async function purgeAudit(env, b) {
 }
 
 // ------------------------------------------------------------------ 登录、会话与二次验证
+let SESSION_KEY_CACHE = null;
 async function sessionKey(env) {
-  const raw = await crypto.subtle.digest('SHA-256', enc.encode('sbyg-session:' + env.ADMIN_PASSWORD));
-  return crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  // 同一 isolate 内复用（ADMIN_PASSWORD 改变后自动重新生成）
+  if (!SESSION_KEY_CACHE || SESSION_KEY_CACHE.src !== env.ADMIN_PASSWORD) {
+    const raw = await crypto.subtle.digest('SHA-256', enc.encode('sbyg-session:' + env.ADMIN_PASSWORD));
+    SESSION_KEY_CACHE = { src: env.ADMIN_PASSWORD, key: await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']) };
+  }
+  return SESSION_KEY_CACHE.key;
 }
 
 async function passwordOk(env, password) {
@@ -635,13 +647,26 @@ export function ipInCidr(ip, cidr) {
 }
 
 // ------------------------------------------------------------------ 服务器列表（KV）
-async function getServers(env) {
+// decrypt=false：只需名称/地址/分组等字段时（列表、分组、订阅缓存命中）不解密 Token，避免每个请求解密全部服务器
+async function getServers(env, decrypt = true) {
   const list = await kvJson(env, 'servers', []);
-  for (const s of list) {
-    // 单台解密失败只影响该服务器（连接时报出原因），列表与面板其余功能照常可用
-    try { s.token = await decSecret(env, s.token); } catch (e) { s._enc = s.token; s.token = ''; s.tokenError = e.message; }
-  }
+  if (decrypt) for (const s of list) await openToken(env, s);
   return list;
+}
+
+// 单台解密失败只影响该服务器（连接时报出原因），列表与面板其余功能照常可用
+async function openToken(env, s) {
+  if (s._open) return s;
+  try { s.token = await decSecret(env, s.token); } catch (e) { s._enc = s.token; s.token = ''; s.tokenError = e.message; }
+  Object.defineProperty(s, '_open', { value: true }); // 不可枚举：不会写入 KV 或导出
+  return s;
+}
+
+// 按 ID 取一台服务器，只解密这一台（面板刷新时每台服务器各一个请求，原先每个请求都要解密全部服务器）
+async function getServer(env, id) {
+  const srv = (await getServers(env, false)).find((s) => s.id === id);
+  if (!srv) throw httpError(404, '服务器不存在');
+  return openToken(env, srv);
 }
 
 async function putServers(env, list) {
@@ -663,13 +688,16 @@ async function putSettings(env, settings) {
 
 // 加密数据无法解密时的提示（显示在面板顶部），不含任何密文
 async function secretProblem(env, settings) {
-  const raw = await kvJson(env, 'servers', []);
-  const enc = raw.filter((s) => String(s.token || '').startsWith('enc:v1:')).length;
-  const t = await env.SBYG_KV.get('totp_secret');
-  const anyEnc = enc || settings._tgEnc || String(settings.tg.token || '').startsWith('enc:v1:') || (t && t.startsWith('enc:v1:'));
+  const [raw, t] = await Promise.all([kvJson(env, 'servers', []), env.SBYG_KV.get('totp_secret')]);
+  const encd = raw.filter((s) => String(s.token || '').startsWith('enc:v1:'));
+  const anyEnc = encd.length || settings._tgEnc || String(settings.tg.token || '').startsWith('enc:v1:') || (t && t.startsWith('enc:v1:'));
   if (!anyEnc) return '';
   let err = settings._secretErr || '';
-  if (!err && enc) err = (await getServers(env)).map((s) => s.tokenError).find(Boolean) || '';
+  // 只解密带密文的服务器，遇到第一个错误即停止（原先另读一次 KV 并解密全部服务器）
+  for (const s of encd) {
+    if (err) break;
+    err = (await openToken(env, s)).tokenError || '';
+  }
   if (!err && t && t.startsWith('enc:v1:')) { try { await decSecret(env, t); } catch (e) { err = e.message; } }
   return err;
 }
@@ -849,15 +877,29 @@ async function importData(env, data) {
 }
 
 // ------------------------------------------------------------------ 最新版本
-async function latestVersions(env, refresh) {
+// 版本信息缓存30分钟；过期后先返回旧数据并在后台刷新（打开面板不再等待 GitHub 的3个请求）
+let LATEST_PENDING = null;
+async function latestVersions(env, refresh, ctx) {
   const cached = refresh ? null : await kvJson(env, 'latest', null);
   if (cached && Date.now() - cached.t < 1800000) return cached;
-  const get = async (f) => {
-    const r = await fetch(UPSTREAM + '/' + f, { headers: { 'user-agent': 'sbyg-worker/' + VERSION } });
+  if (cached && ctx && ctx.waitUntil) {
+    if (!LATEST_PENDING) {
+      LATEST_PENDING = fetchLatest(env).catch(() => null).finally(() => { LATEST_PENDING = null; });
+      ctx.waitUntil(LATEST_PENDING);
+    }
+    return cached;
+  }
+  return fetchLatest(env);
+}
+
+async function fetchLatest(env) {
+  const get = async (f, upto) => {
+    const r = await fetch(UPSTREAM + '/' + f, { headers: { 'user-agent': 'sbyg-worker/' + VERSION, ...(upto ? { range: 'bytes=0-' + upto } : {}) } });
     if (!r.ok) throw httpError(502, '获取 GitHub 版本失败：HTTP ' + r.status);
     return r.text();
   };
-  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py'), coreVersions().catch(() => ({}))]);
+  // sbagent.py 约 100KB，而版本号在文件开头：只取前 8KB（服务器不支持 Range 时返回整个文件，结果相同）
+  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py', 8191), coreVersions().catch(() => ({}))]);
   const line = (ver.split('\n')[0] || '');
   const notes = ver.split(/\n(?=v\d)/)[0].split('\n').slice(1).filter((x) => x.trim()).slice(0, 12);
   const m = agent.match(/^VERSION = "([^"]+)"/m);
@@ -961,7 +1003,7 @@ async function refreshLinks(env, srv, rev) {
 }
 
 async function linkOverview(env) {
-  const servers = await getServers(env);
+  const servers = await getServers(env, false);
   return Promise.all(servers.map(async (s) => {
     const c = await kvJson(env, 'links:' + s.id, null);
     return { id: s.id, name: s.name, t: c ? c.t : 0, protos: c ? [...new Set(c.links.map(linkProto))] : [], count: c ? c.links.length : 0 };
@@ -1002,9 +1044,8 @@ function dedupeName(name, used) {
 }
 
 async function subNodes(env, ids) {
-  const servers = await getServers(env);
+  const [servers, caches] = await Promise.all([getServers(env, false), Promise.all(ids.map((id) => kvJson(env, 'links:' + id, null)))]);
   const out = [];
-  const caches = await Promise.all(ids.map((id) => kvJson(env, 'links:' + id, null)));
   for (const [i, id] of ids.entries()) {
     const srv = servers.find((s) => s.id === id);
     if (!srv) continue;
@@ -1080,7 +1121,7 @@ async function subsView(env, origin) {
 // 节点名优先级：单独设置的名称 > 命名模板（开启时）> 原名称；重名自动加序号
 // 节点键 = 服务器ID|链接类型（如 vless-reality），重置参数后不变，因此自定义名称在重置后依然有效
 export async function buildSubLines(env, sub) {
-  const servers = await getServers(env);
+  const servers = await getServers(env, false);
   const names = sub.names || {};
   const exclude = new Set(sub.exclude || []);
   const used = new Set();
@@ -1098,7 +1139,8 @@ export async function buildSubLines(env, sub) {
     const srv = servers.find((s) => s.id === id);
     if (!srv) return null;
     const cache = await kvJson(env, 'links:' + id, null);
-    return [srv, cache || await refreshLinks(env, srv).catch(() => null)];
+    // 只有缓存缺失、需要向服务器获取时才解密该服务器的 Token
+    return [srv, cache || await refreshLinks(env, await openToken(env, srv)).catch(() => null)];
   }));
   for (const item of caches) {
     if (!item || !item[1]) continue;
@@ -1119,10 +1161,9 @@ async function serveSub(request, env, ctx, token) {
   if (!/^[a-f0-9]{32}$/.test(token) || !env.SBYG_KV) return notFound();
   const sub = (await getSubs(env)).find((s) => s.token === token);
   if (!sub || sub.enabled === false || (sub.expires && Date.now() > sub.expires)) return notFound();
-  const lines = await buildSubLines(env, sub);
   const ip = clientIp(request);
   const statKey = 'substat:' + sub.id;
-  const stat = await kvJson(env, statKey, { hits: 0, ips: [] });
+  const [lines, stat] = await Promise.all([buildSubLines(env, sub), kvJson(env, statKey, { hits: 0, ips: [] })]);
   const known = stat.ips.find((x) => x.ip === ip);
   if (known) { known.last = Date.now(); known.n = (known.n || 0) + 1; } else stat.ips.unshift({ ip, cc: (request.cf && request.cf.country) || '', first: Date.now(), last: Date.now(), n: 1 });
   stat.ips = stat.ips.slice(0, 50);
@@ -1425,10 +1466,36 @@ function hex(u8) {
 }
 
 // ------------------------------------------------------------------ 前端页面
+// 页面脚本（约 150KB）单独作为 /app.<内容hash>.js 提供，浏览器长期缓存，内容变化后 hash 随之改变；
+// HTML 只剩样式与外壳（约 5KB），仍每次生成新的 nonce。原先整页内联且 no-store，每次打开都要重新下载并解析全部脚本
+let PAGE_PARTS = null;
+function pageParts() {
+  if (!PAGE_PARTS) {
+    const a = PAGE.indexOf('<script>'), b = PAGE.lastIndexOf('</script>');
+    const js = PAGE.slice(a + 8, b);
+    let h = 0x811c9dc5; // FNV-1a 32位
+    for (let i = 0; i < js.length; i++) { h ^= js.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    PAGE_PARTS = { head: PAGE.slice(0, a), tail: PAGE.slice(b + 9), js, src: '/app.' + (h >>> 0).toString(16).padStart(8, '0') + '.js' };
+  }
+  return PAGE_PARTS;
+}
+
+function appScript(p) {
+  const P = pageParts();
+  // 部署切换期间请求到旧 hash：返回当前脚本但不缓存
+  return new Response(P.js, {
+    headers: {
+      'content-type': 'text/javascript; charset=utf-8', 'x-content-type-options': 'nosniff',
+      'cache-control': p === P.src ? 'public, max-age=31536000, immutable' : 'no-store',
+    },
+  });
+}
+
 function page() {
   // 每次响应生成新的 nonce，CSP 只允许带该 nonce 的脚本执行（页面不使用任何内联事件属性）
   const nonce = b64(crypto.getRandomValues(new Uint8Array(16)));
-  return new Response(PAGE.replace('<script>', '<script nonce="' + nonce + '">'), {
+  const P = pageParts();
+  return new Response(P.head + '<script nonce="' + nonce + '" src="' + P.src + '"></script>' + P.tail, {
     headers: {
       'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
       'x-frame-options': 'DENY', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer',
@@ -1444,6 +1511,7 @@ const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sing-box-yg 管理面板</title>
+<meta name="color-scheme" content="light dark">
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--fg:#1d2330;--muted:#6b7280;--line:#e3e6ea;--accent:#2563eb;--accent-fg:#fff;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--chip:#eef2f7;--code:#f1f3f6;--bar:#93b4f5}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1218;--card:#171b23;--fg:#e6e8ec;--muted:#9aa3af;--line:#2a303b;--accent:#3b82f6;--accent-fg:#fff;--ok:#22c55e;--bad:#f87171;--warn:#fbbf24;--chip:#232a35;--code:#11151c;--bar:#2f5bb5}}
@@ -1506,7 +1574,7 @@ svg text{fill:var(--muted);font-size:10px}
 </style>
 </head>
 <body>
-<div id="app"></div>
+<div id="app"><p class="muted" style="padding:16px">加载中…</p></div>
 <script>
 (function(){
 var $app=document.getElementById('app');
@@ -1570,7 +1638,11 @@ function showLogin(){
  }).catch(function(e){$app.innerHTML='<div class="login card err">'+esc(e.message)+'</div>'});
 }
 function bootError(e){if(/未登录/.test(e&&e.message||''))return;$app.innerHTML='<div class="login card"><h3>面板加载失败</h3><p class="err">'+esc(e&&e.message||String(e))+'</p><p class="small muted">若提示与 DATA_KEY 有关：DATA_KEY 必须以「机密(Secret)」添加并保持原值；以「文本变量」添加时，下次从 Git/wrangler 部署会被删除。恢复原值后刷新即可。</p><button class="primary" id="b-retry">重试</button></div>';$('b-retry').addEventListener('click',function(){location.reload()})}
-function boot(){api('/api/me').then(function(j){S.me=j;document.title=j.settings.title;renderShell();go(S.tab)}).catch(bootError)}
+// 服务器列表与 /api/me 同时请求（原先等 /api/me 返回、渲染完外壳后才开始请求列表）；未登录时预取结果被忽略
+var PRE=null;
+function boot(){
+ PRE=fetch('/api/servers',{headers:{'x-sbyg':'1'},credentials:'same-origin'}).then(function(r){return r.ok?r.json():null}).catch(function(){return null});
+ api('/api/me').then(function(j){S.me=j;document.title=j.settings.title;renderShell();go(S.tab)}).catch(function(e){PRE=null;bootError(e)})}
 
 var TABS=[['servers','服务器'],['traffic','流量统计'],['subs','订阅管理'],['audit','审计日志'],['settings','设置']];
 function renderShell(){
@@ -1607,7 +1679,8 @@ function verCmp(a,b){a=String(a||'').replace(/^v/,'').split(/[.-]/).map(Number);
 function needUpgrade(d){var L=S.latest;return !!(L&&d&&((L.agent&&verCmp(d.agent,L.agent)<0)||(L.script&&d.script_version&&verCmp(d.script_version,L.script)<0)))}
 function loadLatest(force){return api('/api/latest'+(force?'?refresh=1':'')).then(function(j){S.latest=j.data;scheduleRender();return j.data})}
 function visibleServers(){return S.groupFilter==null?S.servers.slice():S.servers.filter(function(s){return (s.group||'')===S.groupFilter})}
-function loadServers(){return api('/api/servers').then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
+function loadServers(){var pre=PRE;PRE=null;
+ return (pre?pre.then(function(j){return j&&j.ok?j:api('/api/servers')}):api('/api/servers')).then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
 var renderPending=false;
 function scheduleRender(){if(renderPending)return;renderPending=true;requestAnimationFrame(function(){renderPending=false;renderGrid()})}
 function renderGrid(){
