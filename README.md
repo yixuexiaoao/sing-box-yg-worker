@@ -20,9 +20,12 @@
 - 搜索：源IP/访问地址（可精确匹配）、协议、出站、归属地/运营商、最少流量；记住上次条件
 - **IP归属地与设备详情**：公开IP库（默认 ipwho.is，HTTPS；可换 ip-api.com 获得移动网络/机房/代理标记，但为明文HTTP；或关闭），缓存30天，内网地址不外发；**所有显示IP的地方（含审计日志）都显示归属地**；设备详情按「经由服务器」分别列出流量、协议、访问地址、时间分布与最近连接记录
 
-**升级 sing-box-yg**
-- 服务器卡片显示脚本与 agent 版本，与 GitHub 最新版本对比并标记「可升级」
-- 「检查更新」中可勾选升级或一键升级全部；服务器只从其内置仓库地址（HTTPS）下载，校验语法后替换并重启 agent，失败自动回滚；不重启 Sing-box、不改变节点参数
+**升级 sing-box-yg 与 sing-box 内核**
+- 服务器卡片显示脚本、agent 与内核版本，与 GitHub 最新版本对比并标记「可升级」「有新内核」
+- 「检查更新」中选择升级内容（脚本与 agent / 内核最新正式版 / 最新测试版 / 指定版本 / 脚本+内核），勾选升级或一键升级全部（每批3台）
+- 脚本：服务器只从其内置仓库地址（HTTPS）下载，校验语法后替换并重启 agent，失败自动回滚，不影响节点
+- 内核：服务器只从 SagerNet 官方 Releases 下载，确认能运行且通过 `sing-box check` 后才替换，运行失败自动恢复旧内核（切换时节点中断几秒）
+- **服务器默认不允许远程升级**（这是唯一会让服务器运行新代码的操作），需在 VPS 上 `sb` → 19 → 6 选择 4 单独开启；内核升级需 sbagent 1.4.0
 
 **服务器分组与流量周期**
 - 服务器可分组（编辑时设置或批量设置、可重命名），按分组显示、筛选、批量操作和统计
@@ -48,13 +51,14 @@
 
 - Worker 通过 `cloudflare:sockets` 直连 `服务器IP:端口`；每个请求 **AES-256-CBC 加密 + HMAC-SHA256 签名**（密钥由服务器 Token 派生），带时间戳（±300 秒）与一次性 nonce，响应同样加密并与请求 nonce 绑定
 - 服务器端（sbagent）：
-  - **权限分级**：只读 / 查看节点链接 / 管理，安装时选择；**权限、IP白名单、Token 只能在 VPS 上修改，API 中没有任何修改它们或执行命令的接口**——Token 万一泄露，对方也无法控制 VPS 或提升权限
+  - **权限分级**：只读 / 查看节点链接 / 管理，另有默认关闭的「远程升级」，安装时选择；**权限、IP白名单、Token 只能在 VPS 上修改，API 中没有任何修改它们或执行命令的接口**——Token 万一泄露，对方也无法控制 VPS 或提升权限
   - 可选 IP 白名单；同一 IP 认证失败 10 次封禁 1 小时；两次重置的最小间隔；未通过校验的请求一律返回 404；审计日志
 - 面板：
   - `ADMIN_PASSWORD` 机密变量（少于12位会提示）；可选 TOTP 二次验证（每个验证码只能使用一次）与登录 IP 白名单；同一 IP 连续失败 10 次锁定 15 分钟
   - `__Host-` 前缀 HttpOnly + Secure + SameSite=Strict 会话 Cookie，带会话版本号，可一键退出所有设备；修改密码后全部会话失效
   - 写操作要求自定义请求头并校验 Origin（防 CSRF）；页面 CSP 使用每次请求随机的 nonce，禁止内联事件与外部脚本；所有输出均转义
-  - Token、TG Bot Token、TOTP 密钥只保存在 KV 中，接口不返回；导出备份需再次输入密码，并记入审计日志
+  - Token、TG Bot Token、TOTP 密钥接口不返回；**设置 `DATA_KEY` 机密后在 KV 中加密保存**（AES-256-GCM）；导出备份需再次输入密码，并记入审计日志
+- 威胁模型与审计结论见 [SECURITY.md](SECURITY.md)
 
 > 服务器会校验请求时间，请确保 VPS 系统时间准确（误差在 5 分钟内）。
 
@@ -65,7 +69,7 @@
 1. Cloudflare 后台 → **存储和数据库 → KV** → 创建命名空间，例如 `sbyg`
 2. **Workers 和 Pages → 创建 → Worker**，名称随意，部署后点击 **编辑代码**，把 [`src/worker.js`](src/worker.js) 全部内容粘贴进去并部署
 3. Worker → **设置 → 绑定** → 添加 **KV 命名空间**，变量名填 `SBYG_KV`，选择第 1 步的命名空间
-4. Worker → **设置 → 变量和机密** → 添加 **机密(Secret)**，名称 `ADMIN_PASSWORD`，值为面板登录密码（建议 16 位以上）
+4. Worker → **设置 → 变量和机密** → 添加 **机密(Secret)**，名称 `ADMIN_PASSWORD`，值为面板登录密码（建议 16 位以上）；再添加机密 **`DATA_KEY`**（任意长随机字符串，用于加密保存服务器 Token，设置后不要修改）
 5. Worker → **设置 → 触发事件** → 添加 **Cron 触发器** `*/5 * * * *`（离线检测、每日报告、刷新节点缓存需要）
 6. 打开 Worker 地址（可绑定自定义域名），输入密码登录
 
@@ -77,12 +81,13 @@ cd sing-box-yg-worker
 npx wrangler login
 npx wrangler kv namespace create SBYG_KV   # 把输出的 id 填入 wrangler.toml
 npx wrangler secret put ADMIN_PASSWORD
+npx wrangler secret put DATA_KEY           # 推荐：加密保存服务器 Token，设置后不要修改
 npx wrangler deploy                        # wrangler.toml 已包含每5分钟的 Cron 触发器
 ```
 
 ### 方式三：连接 Git 仓库自动构建（Workers Builds）
 
-1. 先按方式一的第 1、4 步创建 KV 命名空间、设置 `ADMIN_PASSWORD` 机密
+1. 先按方式一的第 1、4 步创建 KV 命名空间、设置 `ADMIN_PASSWORD` 与 `DATA_KEY` 机密
 2. 把 [`wrangler.toml`](wrangler.toml) 中 `kv_namespaces` 的 `id` 改成**你自己的** KV 命名空间 ID（后台 KV 列表中可复制）
 3. Workers 和 Pages → 创建 → 导入 Git 仓库，部署命令保持 `npx wrangler deploy`
 
@@ -114,7 +119,8 @@ node test/dev-server.mjs 8787
 
 - **连接服务器超时**：检查 IP/端口、VPS 防火墙与云厂商安全组；Cloudflare 不允许 Worker 连接 Cloudflare 自身 IP 段与 25 端口
 - **服务器拒绝请求(404)**：Token 或 API 路径不一致（VPS 上更换过 Token 需在面板编辑同步）、来源IP不在服务器 API 白名单内或已被封禁、VPS 时间误差超过 5 分钟
-- **权限不足**：服务器 API 权限只能在 VPS 上通过 `sb` → 19 → 6 修改
+- **权限不足**：服务器 API 权限只能在 VPS 上通过 `sb` → 19 → 6 修改；远程升级需选择 4
+- **更换了 `DATA_KEY`**：已加密的 Token 无法解密，需改回原值，或在面板中重新填写各服务器 Token
 - **流量统计没有数据**：需在服务器「日志/流量/定时」中开启流量统计，且服务器 API 服务在运行（采集由 sbagent 完成）
 - **被登录白名单锁在外面**：在 Cloudflare 后台 KV 中删除 `settings` 键即可恢复默认设置
 - **Vmess 源IP 显示 127.0.0.1**：Vmess 经 Argo 隧道转发时 sing-box 只能看到本地连接；经 CDN 时看到的是 CDN 节点 IP

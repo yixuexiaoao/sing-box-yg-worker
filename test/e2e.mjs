@@ -47,6 +47,9 @@ globalThis.fetch = async (u, opt) => {
     const f = String(u).split('/').pop();
     return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
   }
+  if (String(u).startsWith('https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box')) {
+    return new Response(JSON.stringify({ versions: ['1.15.0-alpha.2', '1.14.4', '1.15.0-alpha.10', '1.14.3', 'bad;version', '1.13.0-rc.1'] }));
+  }
   if (String(u).startsWith('https://ipwho.is/')) {
     whoisCalls++;
     const ip = decodeURIComponent(String(u).slice(17).split('?')[0]);
@@ -63,7 +66,16 @@ await new Promise((r) => upSrv.listen(0, '127.0.0.1', r));
 env0.SB_UPDATE_BASE = 'http://127.0.0.1:' + upSrv.address().port;
 env0.SB_SCRIPT = path.join(sbDir, '..', 'usr_bin_sb');
 fs.writeFileSync(env0.SB_SCRIPT, '#!/bin/bash\n# old\n');
-const agent = spawn('python', ['-X', 'utf8', agentCopy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
+let agent = spawn('python', ['-X', 'utf8', agentCopy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
+const restartAgent = async (perms) => {
+  const conf = JSON.parse(fs.readFileSync(path.join(sbDir, 'sbapi.json'), 'utf8'));
+  conf.perms = perms;
+  fs.writeFileSync(path.join(sbDir, 'sbapi.json'), JSON.stringify(conf));
+  agent.kill();
+  await new Promise((r) => setTimeout(r, 800));
+  agent = spawn('python', ['-X', 'utf8', agentCopy, 'serve'], { env: env0, stdio: ['ignore', 'inherit', 'inherit'] });
+  await new Promise((r) => setTimeout(r, 1500));
+};
 await new Promise((r) => setTimeout(r, 1500));
 
 const env = { ADMIN_PASSWORD: 'pw-123456', SBYG_KV: memoryKV() };
@@ -327,6 +339,7 @@ try {
   // ---------- 升级 sing-box-yg
   r = await req('GET', '/api/latest');
   check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
+  check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
   const gh = ghCalls;
   await req('GET', '/api/latest');
   check(ghCalls === gh, 'latest versions cached');
@@ -336,6 +349,14 @@ try {
   upFiles['/sb.sh'] = '#!/bin/bash\nexport sbrepo="x"\necho new\n';
   upFiles['/sbagent.py'] = agentSrc.replace(/^VERSION = "[^"]+"/m, 'VERSION = "9.9.9"');
   upFiles['/version'] = 'v99.1更新内容：\nx\n';
+  r = await call('upgrade');
+  check(r.status === 502 && /upgrade/.test(r.body.error) && fs.readFileSync(env0.SB_SCRIPT, 'utf8').includes('# old'),
+    'remote upgrade refused by default even with manage permission (no code execution via a leaked token)');
+  r = await call('coreupgrade', { version: '1.14.3' });
+  check(r.status === 502 && /upgrade/.test(r.body.error), 'core upgrade refused by default (needs separate upgrade permission)');
+  await restartAgent(['read', 'links', 'manage', 'upgrade']);
+  r = await call('coreupgrade', { version: '1.2.3;id' });
+  check(r.status === 502 && /版本格式错误/.test(r.body.error), 'core upgrade rejects malformed version even with permission');
   r = await call('upgrade');
   check(r.status === 200 && r.body.data.to.agent === '9.9.9' && r.body.data.to.script === 'v99.1' && fs.readFileSync(env0.SB_SCRIPT, 'utf8').includes('echo new'), 'upgrade via panel replaces files on the server');
   r = await req('GET', '/api/audit?kind=op&limit=50');
@@ -352,6 +373,32 @@ try {
   check(r.status === 403, 'export requires password');
   r = await post('/api/export', { password: 'pw-123456' });
   check(r.status === 200 && r.body.servers[0].token === token && Array.isArray(r.body.subs), 'export with password includes tokens + subs');
+
+  // ---------- 敏感数据加密存储（DATA_KEY）
+  const rawServers = () => JSON.parse(env.SBYG_KV._map.get('servers').value);
+  check(rawServers()[0].token === token, 'without DATA_KEY tokens are stored as-is');
+  await post('/api/settings', { tg: { token: '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ', chat: '-100123456' } });
+  env.DATA_KEY = 'test-data-key-' + crypto.randomUUID();
+  await mod.cronTick(env);
+  check(rawServers().every((x) => String(x.token).startsWith('enc:v1:')) && !JSON.stringify(rawServers()).includes(token), 'cron migrates server tokens to AES-GCM encrypted form');
+  const rawSettings = JSON.parse(env.SBYG_KV._map.get('settings').value);
+  check(rawSettings.tg.token.startsWith('enc:v1:') && !JSON.stringify(rawSettings).includes('ABCDEFGHIJ'), 'TG bot token encrypted at rest');
+  check((await env.SBYG_KV.get('totp_secret')).startsWith('enc:v1:') && !(await env.SBYG_KV.get('totp_secret')).includes(secret), 'TOTP secret encrypted at rest');
+  r = await call('ping');
+  check(r.status === 200 && r.body.data.pong, 'servers still reachable with encrypted tokens');
+  r = await post('/api/export', { password: 'pw-123456' });
+  check(r.status === 200 && r.body.servers[0].token === token, 'export (password protected) still returns usable tokens');
+  r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', token: 'new-token-' + 'x'.repeat(20) });
+  check(rawServers()[0].token.startsWith('enc:v1:'), 'newly saved tokens are encrypted');
+  await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', token });
+  const goodKey = env.DATA_KEY;
+  env.DATA_KEY = 'wrong-key';
+  r = await call('ping');
+  check(r.status === 500 && /DATA_KEY/.test(r.body.error), 'wrong DATA_KEY fails loudly instead of using garbage');
+  env.DATA_KEY = goodKey;
+  check((await req('GET', '/api/me')).body.dataEncrypted === true, 'panel reports data encryption on');
+  r = await post('/api/login', { password: 'pw-123456', code: await freshCode() });
+  check(r.status === 200, 'TOTP login works with encrypted secret');
 
   // ---------- 定时任务：离线检测与恢复
   await post('/api/settings', { monitor: { enabled: true, failCount: 2 }, tg: { events: { offline: false, recover: false } } });
