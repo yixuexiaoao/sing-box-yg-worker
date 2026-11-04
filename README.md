@@ -43,6 +43,15 @@ npx wrangler secret put ADMIN_PASSWORD
 npx wrangler deploy
 ```
 
+### 方式三：连接 Git 仓库自动构建（Workers Builds）
+
+1. 先按方式一的第 1、4 步创建 KV 命名空间、设置 `ADMIN_PASSWORD` 机密
+2. 把 [`wrangler.toml`](wrangler.toml) 中 `kv_namespaces` 的 `id` 改成**你自己的** KV 命名空间 ID（后台 KV 列表中可复制）
+3. Workers 和 Pages → 创建 → 导入 Git 仓库，部署命令保持 `npx wrangler deploy`
+
+> 注意：自动构建时以 `wrangler.toml` 为准，会覆盖后台手动设置的 KV 绑定、`workers_dev` 等配置；
+> ID 填错会报 `KV namespace '...' is not valid [code: 10042]`。机密变量不会被覆盖。
+
 ## 添加服务器
 
 1. 在 VPS 上运行 `sb`，选择 **19：API管理 → 1：安装/重启API服务**

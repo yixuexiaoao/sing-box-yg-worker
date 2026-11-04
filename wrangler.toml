@@ -1,11 +1,19 @@
 name = "sing-box-yg-worker"
 main = "src/worker.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-11-04"
 
-# 先执行：npx wrangler kv namespace create SBYG_KV ，把输出的 id 填到下面
+# 通过 workers.dev 子域名访问面板；如只用自定义域名，可改为 false
+workers_dev = true
+# 关闭版本预览链接，避免面板出现额外的公开访问地址
+preview_urls = false
+
+# KV 命名空间：Cloudflare 后台 → 存储和数据库 → KV 中可查看 ID
+# 连接 Git 自动构建时，部署以本文件为准，会覆盖后台设置的绑定，因此这里必须填写真实 ID
+# 如果你 fork 了本仓库，请改成你自己的命名空间 ID（npx wrangler kv namespace create SBYG_KV）
 [[kv_namespaces]]
 binding = "SBYG_KV"
-id = "填写你的KV命名空间ID"
+id = "243b2cc8e56b4aafb0d1793e4b025bda"
 
-# 登录密码请用机密变量设置，不要写在这里：
-#   npx wrangler secret put ADMIN_PASSWORD
+# 登录密码请用机密变量设置，不要写在这里（部署不会覆盖已设置的机密）：
+#   后台：Worker → 设置 → 变量和机密 → 添加机密 ADMIN_PASSWORD
+#   或命令行：npx wrangler secret put ADMIN_PASSWORD
