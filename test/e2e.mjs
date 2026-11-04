@@ -401,7 +401,25 @@ try {
   env.DATA_KEY = 'wrong-key';
   r = await call('ping');
   check(r.status === 500 && /DATA_KEY/.test(r.body.error), 'wrong DATA_KEY fails loudly instead of using garbage');
+  // DATA_KEY 丢失（如以文本变量添加、被 Git 部署删除）：面板仍能打开并提示原因，密文不被破坏
+  const encBefore = JSON.stringify(rawServers()), setBefore = env.SBYG_KV._map.get('settings').value;
+  for (const k of ['wrong-key', undefined]) {
+    env.DATA_KEY = k;
+    check((await req('GET', '/api/pre')).status === 200, 'login page loads when DATA_KEY is ' + (k ? 'wrong' : 'missing'));
+    r = await req('GET', '/api/me');
+    check(r.status === 200 && /DATA_KEY/.test(r.body.secretError) && r.body.settings.tg.tokenSet && !JSON.stringify(r.body).includes('enc:v1:'), 'panel loads with a clear DATA_KEY error (' + (k ? 'wrong' : 'missing') + ')');
+    r = await req('GET', '/api/servers');
+    check(r.status === 200 && r.body.data.length === 1, 'server list still loads');
+    await post('/api/servers/group', { ids: [id], group: 'g-x' });
+    await post('/api/settings', { title: 'T-' + (k || 'none') });
+    await mod.cronTick(env);
+    check(rawServers()[0].token === JSON.parse(encBefore)[0].token && JSON.parse(env.SBYG_KV._map.get('settings').value).tg.token === JSON.parse(setBefore).tg.token, 'saving servers/settings and cron keep the undecryptable ciphertext intact');
+  }
   env.DATA_KEY = goodKey;
+  r = await call('ping');
+  check(r.status === 200 && r.body.data.pong && !(await req('GET', '/api/me')).body.secretError, 'restoring the original DATA_KEY recovers everything');
+  await post('/api/servers/group', { ids: [id], group: '' });
+  await post('/api/settings', { title: 'Sing-box-yg 管理面板' });
   check((await req('GET', '/api/me')).body.dataEncrypted === true, 'panel reports data encryption on');
   r = await post('/api/login', { password: 'pw-123456', code: await freshCode() });
   check(r.status === 200, 'TOTP login works with encrypted secret');

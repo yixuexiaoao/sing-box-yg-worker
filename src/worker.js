@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -79,7 +79,7 @@ async function route(request, env, ctx) {
 
   const note = (kind, act, extra) => logEvent(env, ctx, settings, who, kind, act, extra);
 
-  if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS, weakPassword: String(env.ADMIN_PASSWORD).length < 12, dataEncrypted: !!env.DATA_KEY });
+  if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS, weakPassword: String(env.ADMIN_PASSWORD).length < 12, dataEncrypted: !!env.DATA_KEY, secretError: await secretProblem(env, settings) });
   if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1') });
   if (p === '/api/settings' && m === 'POST') {
     const body = await readJson(request);
@@ -116,7 +116,7 @@ async function route(request, env, ctx) {
       throw httpError(403, '密码错误');
     }
     note('panel', '导出配置（含Token）', { ok: true });
-    const data = { version: VERSION, time: Date.now(), servers: await getServers(env), subs: await getSubs(env) };
+    const data = { version: VERSION, time: Date.now(), servers: (await getServers(env)).map(({ _enc, tokenError, ...x }) => x), subs: await getSubs(env) };
     return new Response(JSON.stringify(data, null, 2), {
       headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'content-disposition': 'attachment; filename="sbyg-backup.json"' },
     });
@@ -290,14 +290,16 @@ async function getSettings(env) {
   const s = await kvJson(env, 'settings', {});
   const out = { ...DEFAULT_SETTINGS, ...s };
   out.tg = { ...DEFAULT_SETTINGS.tg, ...(s.tg || {}) };
-  out.tg.token = await decSecret(env, out.tg.token);
+  // 解密失败（DATA_KEY 丢失/被修改）不能让整个面板不可用：Token 视为未设置，保留密文，页面提示原因
+  try { out.tg.token = await decSecret(env, out.tg.token); } catch (e) { out._tgEnc = out.tg.token; out.tg.token = ''; out._secretErr = e.message; }
   out.tg.events = { ...DEFAULT_SETTINGS.tg.events, ...((s.tg && s.tg.events) || {}) };
   out.monitor = { ...DEFAULT_SETTINGS.monitor, ...(s.monitor || {}) };
   return out;
 }
 
 function publicSettings(s) {
-  return { ...s, tg: { chat: s.tg.chat, events: s.tg.events, tokenSet: !!s.tg.token } };
+  const { _tgEnc, _secretErr, ...rest } = s;
+  return { ...rest, tg: { chat: s.tg.chat, events: s.tg.events, tokenSet: !!(s.tg.token || _tgEnc) } };
 }
 
 function num(v, lo, hi, name) {
@@ -635,20 +637,41 @@ export function ipInCidr(ip, cidr) {
 // ------------------------------------------------------------------ 服务器列表（KV）
 async function getServers(env) {
   const list = await kvJson(env, 'servers', []);
-  for (const s of list) s.token = await decSecret(env, s.token);
+  for (const s of list) {
+    // 单台解密失败只影响该服务器（连接时报出原因），列表与面板其余功能照常可用
+    try { s.token = await decSecret(env, s.token); } catch (e) { s._enc = s.token; s.token = ''; s.tokenError = e.message; }
+  }
   return list;
 }
 
 async function putServers(env, list) {
   const out = [];
-  for (const s of list) out.push({ ...s, token: await encSecret(env, s.token) });
+  for (const s of list) {
+    const { _enc, tokenError, ...rest } = s;
+    // 无法解密且未重新填写 Token 的服务器，原样保留密文，恢复 DATA_KEY 后即可继续使用
+    out.push({ ...rest, token: _enc && !s.token ? _enc : await encSecret(env, s.token) });
+  }
   await env.SBYG_KV.put('servers', JSON.stringify(out));
 }
 
 async function putSettings(env, settings) {
-  const out = JSON.parse(JSON.stringify(settings));
-  out.tg.token = await encSecret(env, out.tg.token);
+  const { _tgEnc, _secretErr, ...rest } = settings;
+  const out = JSON.parse(JSON.stringify(rest));
+  out.tg.token = _tgEnc && !out.tg.token ? _tgEnc : await encSecret(env, out.tg.token);
   await env.SBYG_KV.put('settings', JSON.stringify(out));
+}
+
+// 加密数据无法解密时的提示（显示在面板顶部），不含任何密文
+async function secretProblem(env, settings) {
+  const raw = await kvJson(env, 'servers', []);
+  const enc = raw.filter((s) => String(s.token || '').startsWith('enc:v1:')).length;
+  const t = await env.SBYG_KV.get('totp_secret');
+  const anyEnc = enc || settings._tgEnc || String(settings.tg.token || '').startsWith('enc:v1:') || (t && t.startsWith('enc:v1:'));
+  if (!anyEnc) return '';
+  let err = settings._secretErr || '';
+  if (!err && enc) err = (await getServers(env)).map((s) => s.tokenError).find(Boolean) || '';
+  if (!err && t && t.startsWith('enc:v1:')) { try { await decSecret(env, t); } catch (e) { err = e.message; } }
+  return err;
 }
 
 // ------------------------------------------------------------------ 敏感数据加密存储（可选 DATA_KEY 机密）
@@ -1285,6 +1308,7 @@ export async function unseal(env, keys) {
 }
 
 export async function callAgent(srv, action, params, timeoutMs = 60000, openSocket = connect) {
+  if (srv.tokenError) throw httpError(500, srv.tokenError);
   const keys = await deriveKeys(srv.token);
   const nonce = hex(crypto.getRandomValues(new Uint8Array(16)));
   const req = { ts: Math.floor(Date.now() / 1000), nonce, action, params };
@@ -1535,7 +1559,8 @@ function showLogin(){
   $('lf').addEventListener('submit',function(e){e.preventDefault();api('/api/login',{body:{password:$('pw').value,code:val('code')}}).then(boot).catch(function(err){if(err.body&&err.body.needTotp){$('totpf').hidden=false;$('code').focus()}$('lerr').textContent=err.message})});
  }).catch(function(e){$app.innerHTML='<div class="login card err">'+esc(e.message)+'</div>'});
 }
-function boot(){api('/api/me').then(function(j){S.me=j;document.title=j.settings.title;renderShell();go(S.tab)}).catch(function(){})}
+function bootError(e){if(/未登录/.test(e&&e.message||''))return;$app.innerHTML='<div class="login card"><h3>面板加载失败</h3><p class="err">'+esc(e&&e.message||String(e))+'</p><p class="small muted">若提示与 DATA_KEY 有关：DATA_KEY 必须以「机密(Secret)」添加并保持原值；以「文本变量」添加时，下次从 Git/wrangler 部署会被删除。恢复原值后刷新即可。</p><button class="primary" id="b-retry">重试</button></div>';$('b-retry').addEventListener('click',function(){location.reload()})}
+function boot(){api('/api/me').then(function(j){S.me=j;document.title=j.settings.title;renderShell();go(S.tab)}).catch(bootError)}
 
 var TABS=[['servers','服务器'],['traffic','流量统计'],['subs','订阅管理'],['audit','审计日志'],['settings','设置']];
 function renderShell(){
@@ -1561,7 +1586,8 @@ function viewServers(){
  $('b-upg').addEventListener('click',function(){upgradeDialog()});
  var nt=[];
  if(S.me&&S.me.weakPassword)nt.push('⚠ 当前面板密码 ADMIN_PASSWORD 少于12位，建议在 Cloudflare 后台改为更长的随机密码，并在「设置 → 安全」开启二次验证。');
- if(S.me&&!S.me.dataEncrypted)nt.push('⚠ 未设置 DATA_KEY 机密：服务器 Token 以明文保存在 KV 中，能读取 KV 的人即可管理这些服务器。建议在 Worker 设置中添加机密 DATA_KEY（长随机字符串，设置后不要修改），Cron 会自动加密已有数据。');
+ if(S.me&&S.me.secretError)nt.push('⛔ 加密数据无法解密：'+S.me.secretError+'。服务器 Token / TG Token / 二次验证密钥暂不可用（数据未被修改）。请在 Worker 设置中把 DATA_KEY 以「机密(Secret)」恢复为原来的值后刷新；以「文本变量」添加的会在下次 Git/wrangler 部署时被删除。');
+ else if(S.me&&!S.me.dataEncrypted)nt.push('⚠ 未设置 DATA_KEY 机密：服务器 Token 以明文保存在 KV 中，能读取 KV 的人即可管理这些服务器。建议在 Worker 设置中添加机密 DATA_KEY（长随机字符串，设置后不要修改），Cron 会自动加密已有数据。');
  if(nt.length)$('b-notice').innerHTML='<div class="card err small" style="margin-bottom:10px">'+nt.map(esc).join('<br>')+'</div>';
  loadLatest().catch(function(){});
  $('b-io').addEventListener('click',ioDialog);
