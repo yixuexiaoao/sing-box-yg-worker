@@ -1,0 +1,11 @@
+name = "sing-box-yg-worker"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+# 先执行：npx wrangler kv namespace create SBYG_KV ，把输出的 id 填到下面
+[[kv_namespaces]]
+binding = "SBYG_KV"
+id = "填写你的KV命名空间ID"
+
+# 登录密码请用机密变量设置，不要写在这里：
+#   npx wrangler secret put ADMIN_PASSWORD

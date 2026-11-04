@@ -1,0 +1,13 @@
+{
+  "name": "sing-box-yg-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker 多服务器管理面板，配合 sing-box-yg 脚本的 sbagent API 使用",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "node test/dev-server.mjs 8787",
+    "test": "node test/e2e.mjs"
+  },
+  "license": "GPL-3.0"
+}
