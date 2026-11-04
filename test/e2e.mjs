@@ -156,6 +156,12 @@ try {
   r = await call('links');
   check(r.status === 200 && r.body.data.links.length === 3, 'links via worker');
   check(JSON.parse(await env.SBYG_KV.get('links:' + id)).links.length === 3, 'links cached in KV');
+  {
+    const rev0 = JSON.parse(await env.SBYG_KV.get('links:' + id)).rev;
+    const t0 = JSON.parse(await env.SBYG_KV.get('links:' + id)).t;
+    await mod.cronTick(env);
+    check(/^[0-9a-f]{16}$/.test(rev0) && JSON.parse(await env.SBYG_KV.get('links:' + id)).t === t0, 'links cache stores params rev -> cron does not re-fetch links');
+  }
 
   // ---------- 订阅
   r = await post('/api/subs', { name: '我的订阅', servers: [id], protos: ['vless', 'vmess'], rename: true, custom: 'trojan://p@5.6.7.8:443#custom' });

@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -919,15 +919,16 @@ async function geoLookup(env, ctx, settings, ips) {
 async function agentCall(env, srv, action, params, timeoutMs) {
   const data = await callAgent(srv, action, params, timeoutMs || (action === 'reset' ? 300000 : 60000));
   if ((action === 'links' || action === 'reset') && data && Array.isArray(data.links)) {
-    await env.SBYG_KV.put('links:' + srv.id, JSON.stringify({ t: Date.now(), links: data.links, subs: data.subs || [] }));
+    // rev：节点参数版本（sbagent 1.4.1 起随链接返回），Cron 据此判断缓存是否需要刷新
+    await env.SBYG_KV.put('links:' + srv.id, JSON.stringify({ t: Date.now(), links: data.links, subs: data.subs || [], rev: data.rev || '' }));
   }
   return data;
 }
 
 async function refreshLinks(env, srv, rev) {
-  const data = await agentCall(env, srv, 'links', {}, 20000);
-  const c = { t: Date.now(), links: data.links || [], subs: data.subs || [], rev: rev || '' };
-  if (rev) await env.SBYG_KV.put('links:' + srv.id, JSON.stringify(c));
+  const data = await callAgent(srv, 'links', {}, 20000);
+  const c = { t: Date.now(), links: data.links || [], subs: data.subs || [], rev: data.rev || rev || '' };
+  await env.SBYG_KV.put('links:' + srv.id, JSON.stringify(c));
   return c;
 }
 
@@ -975,10 +976,11 @@ function dedupeName(name, used) {
 async function subNodes(env, ids) {
   const servers = await getServers(env);
   const out = [];
-  for (const id of ids) {
+  const caches = await Promise.all(ids.map((id) => kvJson(env, 'links:' + id, null)));
+  for (const [i, id] of ids.entries()) {
     const srv = servers.find((s) => s.id === id);
     if (!srv) continue;
-    const c = await kvJson(env, 'links:' + id, null);
+    const c = caches[i];
     for (const l of (c && c.links) || []) {
       out.push({ key: id + '|' + l.name, serverId: id, server: srv.name, group: srv.group || '', proto: linkProto(l), label: l.name, orig: linkName(l.link) });
     }
@@ -1063,13 +1065,16 @@ export async function buildSubLines(env, sub) {
     if (name) lines.push(renameLink(link, dedupeName(name, used)));
     else lines.push(link);
   };
-  for (const id of sub.servers) {
+  // 各服务器的节点缓存并行读取（缺缓存的并行向服务器获取），再按订阅中的顺序输出
+  const caches = await Promise.all(sub.servers.map(async (id) => {
     const srv = servers.find((s) => s.id === id);
-    if (!srv) continue;
-    let cache = await kvJson(env, 'links:' + id, null);
-    if (!cache) {
-      try { cache = await refreshLinks(env, srv); } catch (_) { continue; }
-    }
+    if (!srv) return null;
+    const cache = await kvJson(env, 'links:' + id, null);
+    return [srv, cache || await refreshLinks(env, srv).catch(() => null)];
+  }));
+  for (const item of caches) {
+    if (!item || !item[1]) continue;
+    const [srv, cache] = item, id = srv.id;
     for (const l of cache.links) {
       const proto = linkProto(l);
       if (sub.protos.length && !sub.protos.includes(proto)) continue;
@@ -1119,6 +1124,7 @@ export async function cronTick(env, now = Date.now()) {
   const settings = await getSettings(env);
   const servers = await getServers(env);
   if (!servers.length) return;
+  const cacheT = {}; // 本轮读到的节点缓存时间（0 = 无缓存），避免下面再逐台读取 KV
   {
     const health = await kvJson(env, 'health', {});
     let changed = false;
@@ -1127,10 +1133,13 @@ export async function cronTick(env, now = Date.now()) {
       const h = health[s.id] || { fails: 0, down: false };
       let ok = true, err = '';
       try {
-        const pong = await callAgent(s, 'ping', {}, 15000);
+        const [pong, cache] = await Promise.all([callAgent(s, 'ping', {}, 15000), kvJson(env, 'links:' + s.id, null)]);
+        cacheT[s.id] = cache ? cache.t : 0;
         // 参数版本变化（VPS 上重置/定时重置/泄露自动重置/改端口等）→ 立即刷新订阅使用的节点缓存
-        const cache = await kvJson(env, 'links:' + s.id, null);
-        if (pong.rev && (!cache || cache.rev !== pong.rev)) await refreshLinks(env, s, pong.rev).catch(() => {});
+        if (pong.rev && (!cache || cache.rev !== pong.rev)) {
+          const c = await refreshLinks(env, s, pong.rev).catch(() => null);
+          if (c) cacheT[s.id] = c.t;
+        }
       } catch (e) { ok = false; err = e.message; }
       if (ok) {
         if (h.down) msgs.push(['recover', '✅ 服务器恢复：' + s.name + '\n离线时长：' + Math.round((now - h.since) / 60000) + ' 分钟']);
@@ -1166,8 +1175,8 @@ export async function cronTick(env, now = Date.now()) {
   // 每次最多刷新一台缓存过期的服务器节点链接，供订阅使用
   const stale = [];
   for (const s of servers) {
-    const c = await kvJson(env, 'links:' + s.id, null);
-    if (c && now - c.t > settings.linkCacheHours * 3600000) stale.push([c.t, s]);
+    const t = cacheT[s.id]; // 只刷新在线（本轮 ping 成功）且已有缓存的服务器
+    if (t && now - t > settings.linkCacheHours * 3600000) stale.push([t, s]);
   }
   stale.sort((a, b) => a[0] - b[0]);
   if (stale.length) await refreshLinks(env, stale[0][1]).catch(() => {});
