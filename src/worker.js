@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.4';
+const VERSION = '1.5.5';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -1682,7 +1682,11 @@ function visibleServers(){return S.groupFilter==null?S.servers.slice():S.servers
 function loadServers(){var pre=PRE;PRE=null;
  return (pre?pre.then(function(j){return j&&j.ok?j:api('/api/servers')}):api('/api/servers')).then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
 var renderPending=false;
-function scheduleRender(){if(renderPending)return;renderPending=true;requestAnimationFrame(function(){renderPending=false;renderGrid()})}
+// 多台服务器的状态陆续返回时合并为一次重绘。页面在后台/隐藏时浏览器暂停 requestAnimationFrame，
+// 原先卡片会一直停在「加载中」且之后的重绘全部被跳过；现在同时设定时器，哪个先到就由哪个执行
+function scheduleRender(){if(renderPending)return;renderPending=true;var done=false;
+ function run(){if(done)return;done=true;renderPending=false;renderGrid()}
+ requestAnimationFrame(run);setTimeout(run,100)}
 function renderGrid(){
  var g=$('grid');if(!g)return;
  var groups=groupNames();
