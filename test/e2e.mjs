@@ -174,7 +174,7 @@ try {
 
   // ---------- 服务器地址：只接受公网地址（主机名/内网IP 在 Worker 上无法连接）
   globalThis.__SBYG_ALLOW_PRIVATE = false;
-  for (const [h, re] of [['free-e2micro', /主机名/], ['10.128.0.2', /内网IP/], ['192.168.1.5', /内网IP/], ['fe80::1', /公网IPv6/]]) {
+  for (const [h, re] of [['free-e2micro', /主机名/], ['10.128.0.2', /内网IP/], ['192.168.1.5', /内网IP/], ['fe80::1', /公网IPv6/], ['100.64.1.1', /内网IP/], ['::ffff:127.0.0.1', /公网IPv6/]]) {
     r = await post('/api/servers', { name: 'x', host: h, port: 1234, path: '/p', token: 'x'.repeat(32) });
     check(r.status === 400 && re.test(r.body.error), 'server host rejected: ' + h);
   }
@@ -478,6 +478,21 @@ try {
   await mod.cronTick(env);
   h = JSON.parse(await env.SBYG_KV.get('health'));
   check(!h[id].down, 'cron marks server recovered');
+
+  // ---------- 持有有效会话时，导出（密码校验）与登录共用同一失败计数
+  await env.SBYG_KV.delete('fail:' + fromIp);
+  for (let i = 0; i < 10; i++) await post('/api/export', { password: 'bad' + i });
+  r = await post('/api/export', { password: 'pw-123456' });
+  check(r.status === 429, 'export password guessing shares the failure counter (429 after 10 bad tries)');
+  await env.SBYG_KV.delete('fail:' + fromIp);
+  // IPv6 按 /64 合并计数
+  fromIp = '2001:db8:1:2::1';
+  for (let i = 0; i < 10; i++) await post('/api/export', { password: 'bad' + i });
+  fromIp = '2001:db8:1:2:ffff::9';
+  r = await post('/api/export', { password: 'pw-123456' });
+  check(r.status === 429, 'IPv6 failures are counted per /64');
+  fromIp = '198.51.100.1';
+  await env.SBYG_KV.delete('fail:' + fromIp);
 
   // ---------- 登录爆破限制
   cookie = '';

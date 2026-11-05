@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.5';
+const VERSION = '1.5.6';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -86,7 +86,7 @@ async function route(request, env, ctx) {
   if (p === '/api/settings' && m === 'POST') {
     const body = await readJson(request);
     const next = sanitizeSettings(body, settings, who.ip);
-    if (next.auditDays < settings.auditDays) await requireTotp(env, settings, body && body.totpCode, '缩短审计日志保留天数');
+    if (next.auditDays < settings.auditDays) await requireTotp(env, settings, body && body.totpCode, '缩短审计日志保留天数', undefined, who);
     await putSettings(env, next);
     note('panel', '修改面板设置', { ok: true });
     return json({ ok: true, settings: publicSettings(next) });
@@ -102,7 +102,7 @@ async function route(request, env, ctx) {
     note('panel', '退出所有设备', { ok: true });
     return json({ ok: true }, 200, { 'set-cookie': COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' });
   }
-  if (p.startsWith('/api/totp/') && m === 'POST') return totpRoute(p.slice(10), request, env, settings, note);
+  if (p.startsWith('/api/totp/') && m === 'POST') return totpRoute(p.slice(10), request, env, settings, note, who);
 
   if (p === '/api/servers' && m === 'GET') return json({ ok: true, data: (await getServers(env, false)).map(publicServer) });
   if (p === '/api/servers' && m === 'POST') {
@@ -113,7 +113,7 @@ async function route(request, env, ctx) {
   }
   if (p === '/api/export' && m === 'POST') {
     const body = await readJson(request);
-    if (!(await passwordOk(env, body && body.password))) {
+    if (!(await guardedCheck(env, who, () => passwordOk(env, body && body.password)))) {
       note('panel', '导出配置', { ok: false, msg: '密码错误' });
       throw httpError(403, '密码错误');
     }
@@ -233,7 +233,7 @@ async function route(request, env, ctx) {
   if (p === '/api/audit' && m === 'GET') return json({ ok: true, data: await listAudit(env, url.searchParams) });
   if (p === '/api/audit/purge' && m === 'POST') {
     const body = (await readJson(request)) || {};
-    await requireTotp(env, settings, body.code, '删除审计日志', note);
+    await requireTotp(env, settings, body.code, '删除审计日志', note, who);
     const r = await purgeAudit(env, body);
     note('panel', '清理审计日志', { ok: true, msg: '删除 ' + r.deleted + ' 条' });
     return json({ ok: true, data: r });
@@ -449,12 +449,30 @@ async function purgeAudit(env, b) {
 // ------------------------------------------------------------------ 登录、会话与二次验证
 let SESSION_KEY_CACHE = null;
 async function sessionKey(env) {
-  // 同一 isolate 内复用（ADMIN_PASSWORD 改变后自动重新生成）
+  // 同一 isolate 内复用（ADMIN_PASSWORD 改变后自动重新生成）。
+  // 用 PBKDF2 加盐派生：即使会话 Cookie 泄露，也无法用一次快速哈希离线暴力破解管理员密码
   if (!SESSION_KEY_CACHE || SESSION_KEY_CACHE.src !== env.ADMIN_PASSWORD) {
-    const raw = await crypto.subtle.digest('SHA-256', enc.encode('sbyg-session:' + env.ADMIN_PASSWORD));
+    const base = await crypto.subtle.importKey('raw', enc.encode(String(env.ADMIN_PASSWORD)), 'PBKDF2', false, ['deriveBits']);
+    const raw = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('sbyg-session-v2'), iterations: 100000 }, base, 256);
     SESSION_KEY_CACHE = { src: env.ADMIN_PASSWORD, key: await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']) };
   }
   return SESSION_KEY_CACHE.key;
+}
+
+// 失败计数按来源计：IPv6 按 /64 合并（攻击者可在整个 /64 内任意换地址）
+function failKeyOf(ip) {
+  const a = ip.includes(':') ? parseIp(ip) : null;
+  return a && a.bits === 128 ? 'fail:' + (a.v >> 64n).toString(16) + '/64' : 'fail:' + ip;
+}
+
+// 所有校验密码/二次验证码的入口共用同一个失败计数：持有有效会话的人也不能无限次猜测
+async function guardedCheck(env, who, fn) {
+  const key = failKeyOf(who.ip);
+  const fails = parseInt((await env.SBYG_KV.get(key)) || '0', 10);
+  if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '失败次数过多，请15分钟后再试');
+  const ok = await fn();
+  if (!ok) await env.SBYG_KV.put(key, String(fails + 1), { expirationTtl: 900 });
+  return ok;
 }
 
 async function passwordOk(env, password) {
@@ -471,7 +489,7 @@ async function login(request, env, ctx, who, settings) {
     note(false, 'IP不在登录白名单');
     throw httpError(403, '当前IP不允许登录');
   }
-  const failKey = 'fail:' + who.ip;
+  const failKey = failKeyOf(who.ip);
   const fails = parseInt((await env.SBYG_KV.get(failKey)) || '0', 10);
   if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '登录失败次数过多，请15分钟后再试');
   const body = (await readJson(request)) || {};
@@ -515,17 +533,18 @@ function timingSafeEqual(a, b) {
   return r === 0;
 }
 
-async function requireTotp(env, settings, code, what, note) {
+async function requireTotp(env, settings, code, what, note, who) {
   // 审计日志等敏感数据的删除：必须已开启二次验证且本次提供正确验证码
   if (!settings.totp) throw httpError(403, what + '需要二次验证，请先在「设置 → 安全」中开启二次验证');
   const secret = await getSecret(env, 'totp_secret');
-  if (!secret || !(await totpVerify(secret, String(code || ''), env))) {
+  const good = !!secret && (who ? await guardedCheck(env, who, () => totpVerify(secret, String(code || ''), env)) : await totpVerify(secret, String(code || ''), env));
+  if (!good) {
     if (note) note('panel', what, { ok: false, msg: '二次验证码错误' });
     throw httpError(403, '二次验证码错误');
   }
 }
 
-async function totpRoute(op, request, env, settings, note) {
+async function totpRoute(op, request, env, settings, note, who) {
   const body = (await readJson(request)) || {};
   if (op === 'setup') {
     const secret = b32encode(crypto.getRandomValues(new Uint8Array(20)));
@@ -545,7 +564,7 @@ async function totpRoute(op, request, env, settings, note) {
   }
   if (op === 'disable') {
     const secret = await getSecret(env, 'totp_secret');
-    if (!(await passwordOk(env, body.password)) || !secret || !(await totpVerify(secret, String(body.code || ''), env))) {
+    if (!secret || !(await guardedCheck(env, who, async () => (await passwordOk(env, body.password)) && (await totpVerify(secret, String(body.code || ''), env))))) {
       note('panel', '关闭二次验证', { ok: false, msg: '密码或验证码错误' });
       throw httpError(403, '密码或验证码错误');
     }
@@ -820,8 +839,8 @@ function validServer(s) {
   // Worker 只能连接公网地址：IPv4/IPv6 或带点的域名。不带点的主机名（如 VM 名称 free-e2micro）与内网地址在公网上无法连接
   const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host), v6 = host.includes(':');
   if (!globalThis.__SBYG_ALLOW_PRIVATE && !v4 && !v6 && !host.includes('.')) throw httpError(400, '服务器地址「' + host + '」是主机名，Worker 无法连接：请填写服务器的公网IP或域名（谷歌云在控制台「外部IP」一栏查看）');
-  if (!globalThis.__SBYG_ALLOW_PRIVATE && v4 && /^(10|127|0|169\.254|192\.168|172\.(1[6-9]|2\d|3[01]))\./.test(host)) throw httpError(400, '「' + host + '」是内网IP，Worker 无法连接：请填写服务器的公网IP（谷歌云/AWS 等网卡上只有内网IP，公网IP在控制台查看）');
-  if (!globalThis.__SBYG_ALLOW_PRIVATE && v6 && /^(fe80|fc|fd)|^::1?$/i.test(host)) throw httpError(400, '「' + host + '」不是公网IPv6地址');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v4 && /^(10|127|0|169\.254|192\.168|172\.(1[6-9]|2\d|3[01])|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])|2(2[4-9]|[3-5]\d))\./.test(host)) throw httpError(400, '「' + host + '」是内网IP，Worker 无法连接：请填写服务器的公网IP（谷歌云/AWS 等网卡上只有内网IP，公网IP在控制台查看）');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v6 && /^(fe80|fc|fd|ff)|^::1?$|^::ffff:/i.test(host)) throw httpError(400, '「' + host + '」不是公网IPv6地址');
   if (!(port > 0 && port < 65536) || port === 25) throw httpError(400, '端口错误');
   if (!/^\/[A-Za-z0-9/_-]{0,64}$/.test(path)) throw httpError(400, 'API路径格式错误');
   return {
@@ -848,7 +867,7 @@ async function saveServer(env, body) {
 }
 
 async function importData(env, data) {
-  const arr = Array.isArray(data) ? data : data && Array.isArray(data.servers) ? data.servers : [data];
+  const arr = (Array.isArray(data) ? data : data && Array.isArray(data.servers) ? data.servers : [data]).slice(0, 200);
   const list = await getServers(env);
   let added = 0, updated = 0;
   for (const raw of arr) {
