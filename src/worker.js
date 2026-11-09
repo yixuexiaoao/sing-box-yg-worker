@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.6';
+const VERSION = '1.5.7';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -152,7 +152,7 @@ async function route(request, env, ctx) {
     return json({ ok: true, data: await geoLookup(env, ctx, settings, Array.isArray(body.ips) ? body.ips : []) });
   }
   if (p === '/api/subs/nodes' && m === 'GET') {
-    const ids = (url.searchParams.get('ids') || '').split(',').filter(Boolean);
+    const ids = (url.searchParams.get('ids') || '').split(',').filter(Boolean).slice(0, 200);
     return json({ ok: true, data: await subNodes(env, ids) });
   }
   let mm = p.match(/^\/api\/servers\/([\w-]+)\/cycle$/);
@@ -188,7 +188,8 @@ async function route(request, env, ctx) {
   if (p === '/api/links' && m === 'GET') return json({ ok: true, data: await linkOverview(env) });
   if (p === '/api/links/refresh' && m === 'POST') {
     const body = (await readJson(request)) || {};
-    const servers = (await getServers(env)).filter((s) => !body.ids || body.ids.includes(s.id));
+    const only = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null;
+    const servers = (await getServers(env)).filter((s) => !only || only.has(s.id));
     const res = await mapLimit(servers, 5, async (s) => {
       try { const c = await refreshLinks(env, s); return { id: s.id, ok: true, count: c.links.length }; } catch (e) { return { id: s.id, ok: false, error: e.message }; }
     });
@@ -1929,7 +1930,7 @@ function statsDialog(s){
  function load(){
   busy($('s-out'));
   call(s.id,'stats',{hours:Number(val('s-hours')),top:300}).then(function(d){data=d;
-   $('s-sum').innerHTML='<span class="stat"><b>'+d.conns+'</b> 连接</span><span class="stat"><b>'+d.unique_ips+'</b> 个源IP</span><span class="stat"><b>'+d.unique_dests+'</b> 个访问目标</span><span class="stat"><b class="'+(d.errors?'err':'')+'">'+d.errors+'</b> 失败/探测</span>';draw()})
+   $('s-sum').innerHTML='<span class="stat"><b>'+esc(d.conns)+'</b> 连接</span><span class="stat"><b>'+esc(d.unique_ips)+'</b> 个源IP</span><span class="stat"><b>'+esc(d.unique_dests)+'</b> 个访问目标</span><span class="stat"><b class="'+(d.errors?'err':'')+'">'+esc(d.errors)+'</b> 失败/探测</span>';draw()})
   .catch(function(e){fail($('s-out'),e)});
  }
  $('s-hours').addEventListener('change',load);
@@ -2023,7 +2024,7 @@ function settingsDialog(s){
   $('g-trs').addEventListener('click',function(){act('trafficconf',{retain_days:Number(val('g-tr'))},'已保存',true)});
   $('g-tprune').addEventListener('click',function(){if(confirm('删除该时间段的流量记录？'))act('trafficpurge',{start:inputTime('g-ts'),end:inputTime('g-te')},'已删除',true)});
   $('g-lsave').addEventListener('click',function(){act('leakconf',{enabled:checked('g-len'),hours:Number(val('g-lh')),threshold:Number(val('g-lt')),action:val('g-la'),items:'all'},'已保存')});
-  $('g-lcheck').addEventListener('click',function(){call(s.id,'leakcheck').then(function(r){$('g-lres').innerHTML='最近 '+esc(r.hours)+' 小时：'+r.unique_ips+' 个源IP（阈值 '+r.threshold+'）'+(r.exceeded?' <b class="err">已超过阈值</b>':' 正常')+'<br>'+r.ips.slice(0,20).map(function(x){return esc(x[0])+'('+x[1]+')'}).join('，')}).catch(function(e){toast(e.message)})});
+  $('g-lcheck').addEventListener('click',function(){call(s.id,'leakcheck').then(function(r){$('g-lres').innerHTML='最近 '+esc(r.hours)+' 小时：'+esc(r.unique_ips)+' 个源IP（阈值 '+esc(r.threshold)+'）'+(r.exceeded?' <b class="err">已超过阈值</b>':' 正常')+'<br>'+r.ips.slice(0,20).map(function(x){return esc(x[0])+'('+esc(x[1])+')'}).join('，')}).catch(function(e){toast(e.message)})});
  }).catch(function(e){fail($('g-out'),e)});
 }
 
