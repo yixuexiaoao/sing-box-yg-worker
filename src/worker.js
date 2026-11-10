@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.7';
+const VERSION = '1.5.8';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -1329,7 +1329,20 @@ function fmtBytes(n) {
 //   {"v":1,"iv":b64,"ct":b64,"z":0|1,"mac":b64}
 //   mac = HMAC-SHA256(SHA256("sbyg-mac:"+token), "v1|" + ("z"|"-") + iv + ct)
 //   ct  = AES-256-CBC(SHA256("sbyg-enc:"+token), iv, z ? zlib(明文) : 明文)
-export async function deriveKeys(token) {
+// isolate 内缓存派生出的密钥（不可导出的 CryptoKey）：Cron/面板反复调用同一台服务器时省去 2 次哈希与 2 次导入
+const KEY_CACHE = new Map();
+export function deriveKeys(token) {
+  let p = KEY_CACHE.get(token);
+  if (!p) {
+    if (KEY_CACHE.size >= 256) KEY_CACHE.delete(KEY_CACHE.keys().next().value);
+    p = deriveKeysRaw(token);
+    KEY_CACHE.set(token, p);
+    p.catch(() => KEY_CACHE.delete(token));
+  }
+  return p;
+}
+
+async function deriveKeysRaw(token) {
   const e = await crypto.subtle.digest('SHA-256', enc.encode('sbyg-enc:' + token));
   const m = await crypto.subtle.digest('SHA-256', enc.encode('sbyg-mac:' + token));
   return {

@@ -499,6 +499,12 @@ try {
   for (let i = 0; i < 10; i++) await post('/api/login', { password: 'bad' + i });
   r = await post('/api/login', { password: 'pw-123456' });
   check(r.status === 429, 'login rate limited after 10 failures');
+  // 1.5.8：派生密钥在 isolate 内缓存，同一 Token 复用、不同 Token 互不影响，加解密结果不变
+  const k1 = mod.deriveKeys('tok-a'), k2 = mod.deriveKeys('tok-a'), k3 = mod.deriveKeys('tok-b');
+  const env1 = await mod.seal({ x: 1 }, await k1);
+  let wrongKey = false;
+  try { await mod.unseal(env1, await k3); } catch (_) { wrongKey = true; }
+  check(k1 === k2 && k1 !== k3 && (await mod.unseal(env1, await k2)).x === 1 && wrongKey, 'derived keys cached per token');
 } finally {
   agent.kill();
   upSrv.close();
