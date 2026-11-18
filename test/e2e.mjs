@@ -48,6 +48,9 @@ globalThis.fetch = async (u, opt) => {
     ghCalls++;
     const f = String(u).split('/').pop();
     if (f === 'sbagent.py') ghRange = (opt && opt.headers && opt.headers.range) || '';
+    ghCacheMode = opt?.cache;
+    if (ghUnavailable) return new Response('', { status: 503 });
+    if (ghBadVersion) return new Response('unknown version');
     return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
   }
   if (String(u).startsWith('https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box')) {
@@ -60,7 +63,7 @@ globalThis.fetch = async (u, opt) => {
   }
   return realFetch(u, opt);
 };
-let whoisCalls = 0, ghCalls = 0, ghRange = '';
+let whoisCalls = 0, ghCalls = 0, ghRange = '', ghCacheMode, ghUnavailable = false, ghBadVersion = false;
 const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
 fs.copyFileSync(agentPy, agentCopy);
 const upFiles = {};
@@ -399,16 +402,27 @@ try {
   check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
   check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
   check(ghRange === 'bytes=0-8191', 'only the head of sbagent.py is fetched for its version');
+  check(ghCacheMode === 'no-store', 'GitHub version fetch bypasses the subrequest cache');
   const gh = ghCalls;
   await req('GET', '/api/latest');
   check(ghCalls === gh, 'latest versions cached');
   {
-    // 缓存过期：立即返回旧数据，后台刷新后更新缓存
+    // 缓存过期：本次请求即得到新版本，查询失败时明确标记之前成功的结果。
     const old = JSON.parse(await env.SBYG_KV.get('latest'));
     await env.SBYG_KV.put('latest', JSON.stringify({ ...old, t: Date.now() - 3600000, script: 'v-old' }));
     r = await req('GET', '/api/latest');
     const fresh = JSON.parse(await env.SBYG_KV.get('latest'));
-    check(r.body.data.script === 'v-old' && ghCalls > gh && fresh.script === 'v99.1' && Date.now() - fresh.t < 60000, 'stale latest versions served at once, refreshed in background');
+    check(r.body.data.script === 'v99.1' && ghCalls > gh && fresh.script === 'v99.1' && Date.now() - fresh.t < 60000, 'expired cache request returns newly fetched versions');
+    await env.SBYG_KV.put('latest', JSON.stringify({ ...old, t: Date.now() - 3600000 }));
+    ghUnavailable = true;
+    r = await req('GET', '/api/latest');
+    check(r.status === 200 && r.body.data.stale === true && r.body.data.script === old.script, 'upstream failure retains and marks stale versions');
+    check((await req('GET', '/api/latest?refresh=1')).status === 502, 'manual version refresh reports upstream failure');
+    ghUnavailable = false;
+    ghBadVersion = true;
+    r = await req('GET', '/api/latest?refresh=1');
+    check(r.status === 502 && JSON.parse(await env.SBYG_KV.get('latest')).script === old.script, 'invalid upstream version does not overwrite cache');
+    ghBadVersion = false;
   }
   r = await call('status');
   check(r.status === 200 && 'script_version' in r.body.data, 'status reports script version');

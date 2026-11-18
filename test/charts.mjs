@@ -17,8 +17,33 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, S } = sandbox.renderers;
+
+const upgradeServer = { id: 'upgrade', name: '待更新', host: '192.0.2.1', port: 1234, cycle: { mode: 'off' } };
+S.latest = { script: 'v26.11.19', agent: '1.4.6' };
+S.status.upgrade = { data: { active: true, script_version: 'v26.11.18', agent: '1.4.5' } };
+const upgradeCard = cardHtml(upgradeServer);
+assert.ok(upgradeCard.includes('VPS 脚本 / agent 可升级'));
+assert.ok(upgradeCard.indexOf('升级服务器') < upgradeCard.indexOf('<details'));
+assert.equal((upgradeCard.match(/data-act="upgrade"/g) || []).length, 1);
+S.status.upgrade.data.agent = '1.4.6';
+assert.ok(cardHtml(upgradeServer).includes('升级服务器'));
+S.status.upgrade.data.script_version = 'v26.11.19';
+assert.ok(!cardHtml(upgradeServer).includes('升级服务器'));
+S.latest = null;
+assert.ok(!cardHtml(upgradeServer).includes('升级服务器'));
+elements['latest-status'] = { textContent: '' };
+sandbox.fetch = async () => Response.json({ ok: true, data: { script: 'v26.11.19', agent: '1.4.6', stale: true } });
+await loadLatest();
+assert.ok(elements['latest-status'].textContent.includes('缓存结果'));
+sandbox.fetch = async () => Response.json({ ok: false, error: '测试请求失败' }, { status: 502 });
+await assert.rejects(loadLatest(true), /测试请求失败/);
+assert.ok(elements['latest-status'].textContent.includes('版本检查失败'));
+sandbox.fetch = async () => Response.json({ ok: true, data: { script: 'v26.11.19', agent: '1.4.6' } });
+await loadLatest(true);
+assert.equal(elements['latest-status'].textContent, '');
+S.latest = null;
 
 assert.equal(csvCell(' @示例'), '"’ @示例"');
 assert.equal(csvCell('＝示例'), '"’＝示例"');

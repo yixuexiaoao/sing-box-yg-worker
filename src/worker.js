@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -82,7 +82,7 @@ async function route(request, env, ctx) {
   const note = (kind, act, extra) => logEvent(env, ctx, settings, who, kind, act, extra);
 
   if (p === '/api/me') return json({ ok: true, version: VERSION, ip: who.ip, cc: who.cc, settings: publicSettings(settings), events: TG_EVENTS, weakPassword: String(env.ADMIN_PASSWORD).length < 12, dataEncrypted: !!env.DATA_KEY, secretError: await secretProblem(env, settings) });
-  if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1', ctx) });
+  if (p === '/api/latest') return json({ ok: true, data: await latestVersions(env, url.searchParams.get('refresh') === '1') });
   if (p === '/api/settings' && m === 'POST') {
     const body = await readJson(request);
     const next = sanitizeSettings(body, settings, who.ip);
@@ -942,34 +942,32 @@ async function importData(env, data) {
 }
 
 // ------------------------------------------------------------------ 最新版本
-// 版本信息缓存30分钟；过期后先返回旧数据并在后台刷新（打开面板不再等待 GitHub 的3个请求）
-let LATEST_PENDING = null;
-async function latestVersions(env, refresh, ctx) {
+// 面板单独请求版本信息。缓存过期时等到更新结果，避免这一页一直显示旧版本。
+async function latestVersions(env, refresh) {
   const cached = refresh ? null : await kvJson(env, 'latest', null);
   if (cached && Date.now() - cached.t < 1800000) return cached;
-  if (cached && ctx && ctx.waitUntil) {
-    if (!LATEST_PENDING) {
-      LATEST_PENDING = fetchLatest(env).catch(() => null).finally(() => { LATEST_PENDING = null; });
-      ctx.waitUntil(LATEST_PENDING);
-    }
-    return cached;
+  try {
+    return await fetchLatest(env);
+  } catch (e) {
+    if (!cached) throw e;
+    return { ...cached, stale: true };
   }
-  return fetchLatest(env);
 }
 
 async function fetchLatest(env) {
   const get = async (f, upto) => {
-    const r = await fetch(UPSTREAM + '/' + f, { headers: { 'user-agent': 'sbyg-worker/' + VERSION, ...(upto ? { range: 'bytes=0-' + upto } : {}) } });
+    const r = await fetch(UPSTREAM + '/' + f, { cache: 'no-store', headers: { 'user-agent': 'sbyg-worker/' + VERSION, ...(upto ? { range: 'bytes=0-' + upto } : {}) } });
     if (!r.ok) throw httpError(502, '获取 GitHub 版本失败：HTTP ' + r.status);
     return r.text();
   };
   // sbagent.py 约 100KB，而版本号在文件开头：只取前 8KB（服务器不支持 Range 时返回整个文件，结果相同）
   const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py', 8191), coreVersions().catch(() => ({}))]);
-  const line = (ver.split('\n')[0] || '');
+  const script = (ver.split('\n')[0] || '').split('更新内容')[0].trim();
   const notes = ver.split(/\n(?=v\d)/)[0].split('\n').slice(1).filter((x) => x.trim()).slice(0, 12);
-  const m = agent.match(/^VERSION = "([^"]+)"/m);
-  const out = { t: Date.now(), script: line.split('更新内容')[0].trim(), agent: m ? m[1] : '', notes, core: core.latest || '', corePre: core.prerelease || '' };
-  await env.SBYG_KV.put('latest', JSON.stringify(out));
+  const m = agent.match(/^VERSION[ \t]*=[ \t]*(["'])(\d+(?:\.\d+){1,3})\1/m);
+  if (!/^v\d+(?:\.\d+){1,3}$/.test(script) || !m) throw httpError(502, 'GitHub 版本文件内容无法识别');
+  const out = { t: Date.now(), script, agent: m[2], notes, core: core.latest || '', corePre: core.prerelease || '' };
+  await env.SBYG_KV.put('latest', JSON.stringify(out)).catch(() => {});
   return out;
 }
 
@@ -1753,7 +1751,7 @@ function go(tab){S.tab=tab;document.querySelectorAll('#nav [data-tab]').forEach(
 function groupNames(){var g={};S.servers.forEach(function(s){g[s.group||'']=(g[s.group||'']||0)+1});return Object.keys(g).sort(function(a,b){return a===''?1:b===''?-1:(a<b?-1:1)}).map(function(k){return [k,g[k]]})}
 function viewServers(){
  $('view').innerHTML='<div class="bar" style="margin-bottom:8px"><button class="primary" id="b-add">添加服务器</button><button id="b-refresh">全部刷新</button>'+
- '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-upg">检查更新</button><button id="b-io">导入/导出</button></div><div id="summary"></div><div id="b-notice"></div>'+
+ '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-upg">检查更新</button><button id="b-io">导入/导出</button></div><div id="summary"></div><div id="latest-status" class="small muted" role="status" style="margin-bottom:8px"></div><div id="b-notice"></div>'+
  '<div class="bar tabs" id="gchips" style="margin-bottom:10px"></div><div id="grid"></div>';
  $('b-add').addEventListener('click',function(){editServer()});
  $('b-refresh').addEventListener('click',refreshAll);
@@ -1772,7 +1770,8 @@ function viewServers(){
 }
 function verCmp(a,b){a=String(a||'').replace(/^v/,'').split(/[.-]/).map(Number);b=String(b||'').replace(/^v/,'').split(/[.-]/).map(Number);for(var i=0;i<Math.max(a.length,b.length);i++){var x=a[i]||0,y=b[i]||0;if(x!==y)return x<y?-1:1}return 0}
 function needUpgrade(d){var L=S.latest;return !!(L&&d&&((L.agent&&verCmp(d.agent,L.agent)<0)||(L.script&&d.script_version&&verCmp(d.script_version,L.script)<0)))}
-function loadLatest(force){return api('/api/latest'+(force?'?refresh=1':'')).then(function(j){S.latest=j.data;scheduleRender();return j.data})}
+function loadLatest(force){return api('/api/latest'+(force?'?refresh=1':'')).then(function(j){S.latest=j.data;var el=$('latest-status');if(el)el.textContent=j.data.stale?'版本检查暂不可用，当前显示缓存结果，可点击「检查更新」重新检查。':'';scheduleRender();return j.data},function(e){var el=$('latest-status');if(el)el.textContent='版本检查失败：'+e.message+'，可点击「检查更新」重试。';throw e})}
+function upgradeHint(s,d){if(!needUpgrade(d))return '';var L=S.latest;return '<div class="bar small" style="margin:8px 0"><span class="err">VPS 脚本 / agent 可升级</span><span class="muted">'+esc(L.script||'')+' · agent '+esc(L.agent||'')+'</span><button data-act="upgrade" data-id="'+esc(s.id)+'">升级服务器</button></div>'}
 function visibleServers(){return S.groupFilter==null?S.servers.slice():S.servers.filter(function(s){return (s.group||'')===S.groupFilter})}
 function loadServers(){var pre=PRE;PRE=null;
  return (pre?pre.then(function(j){return j&&j.ok?j:api('/api/servers')}):api('/api/servers')).then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
@@ -1847,10 +1846,10 @@ function cardHtml(s){
  else{
   dot=d.active?'ok':'warn';
   var tr=d.traffic||{},ap=d.api||{};
-  body='<div class="chips"><span class="chip '+(d.active?'okc':'err')+'">'+(d.active?'运行中':'Sing-box 未运行')+'</span><span class="chip">内核 '+esc(d.version||'未知')+'</span>'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+serverMetrics(d)+'<div class="collection-state"><span class="chip '+(d.log&&d.log.enabled?'okc':'')+'">日志 '+(d.log&&d.log.enabled?'开启':'关闭')+'</span><span class="chip '+(tr.enabled?'okc':'')+'">流量统计 '+(tr.enabled?'开启':'关闭')+'</span>'+(d.schedule?'<span class="chip">定时重置</span>':'')+(d.leak&&d.leak.enabled?'<span class="chip">泄露检测</span>':'')+'</div>'+cycleVisual(s,d)+
-  '<details class="server-details" data-server-details="'+esc(s.id)+'"><summary data-server-details="'+esc(s.id)+'">系统与服务详情'+(needUpgrade(d)?' · 可升级':'')+'</summary><div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
+  body='<div class="chips"><span class="chip '+(d.active?'okc':'err')+'">'+(d.active?'运行中':'Sing-box 未运行')+'</span><span class="chip">内核 '+esc(d.version||'未知')+'</span>'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+upgradeHint(s,d)+serverMetrics(d)+'<div class="collection-state"><span class="chip '+(d.log&&d.log.enabled?'okc':'')+'">日志 '+(d.log&&d.log.enabled?'开启':'关闭')+'</span><span class="chip '+(tr.enabled?'okc':'')+'">流量统计 '+(tr.enabled?'开启':'关闭')+'</span>'+(d.schedule?'<span class="chip">定时重置</span>':'')+(d.leak&&d.leak.enabled?'<span class="chip">泄露检测</span>':'')+'</div>'+cycleVisual(s,d)+
+  '<details class="server-details" data-server-details="'+esc(s.id)+'"><summary data-server-details="'+esc(s.id)+'">系统与服务详情</summary><div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
   '<span>内核</span><span>sing-box '+esc(d.version||'-')+(d.active?'':' <b class="err">未运行</b>')+(needCore(d)?' <span class="chip">有新内核 '+esc(S.latest.core)+'</span>':'')+'</span>'+
-  '<span>版本</span><span>脚本 '+esc(d.script_version||'-')+' · agent '+esc(d.agent)+(needUpgrade(d)?' <span class="chip err">可升级</span> <a data-act="upgrade" data-id="'+esc(s.id)+'">升级</a>':'')+'</span>'+
+  '<span>版本</span><span>脚本 '+esc(d.script_version||'-')+' · agent '+esc(d.agent)+'</span>'+
   '<span>IP</span><span>'+esc(d.server_ip||'-')+'</span>'+
   '<span>运行</span><span>'+fmtUp(d.uptime)+'，负载 '+esc((d.load||[]).join(' '))+(d.mem&&d.mem.MemTotal?'，内存 '+fmtBytes(d.mem.MemTotal-d.mem.MemAvailable)+'/'+fmtBytes(d.mem.MemTotal):'')+'</span>'+
   '<span>日志</span><span>'+(d.log&&d.log.enabled?'已开启 '+fmtBytes(d.log.size)+(d.log.archives?'（归档'+d.log.archives+'份）':''):'<span class="err">未开启</span>')+'</span>'+
@@ -1930,18 +1929,18 @@ function upgradeDialog(preset){
  '<div class="tablewrap" style="margin:8px 0"><table><thead><tr><th><input type="checkbox" id="u-all"></th><th>服务器</th><th>当前脚本</th><th>当前agent</th><th>当前内核</th><th>状态</th></tr></thead><tbody id="u-rows"></tbody></table></div>'+
  '<div class="bar"><button class="primary" id="u-go">升级所选</button><button id="u-outdated">一键升级全部需要升级的</button><button id="u-refresh">重新检查</button><span id="u-st" class="small muted"></span></div>'+
  '<p class="small muted">脚本升级：服务器从其内置的 GitHub 仓库地址下载 sb.sh 与 sbagent.py（HTTPS），校验语法后替换并重启 agent，失败自动回滚，不影响节点。<br>内核升级：服务器从 SagerNet 官方 GitHub Releases 下载对应架构的 sing-box，确认能运行且通过当前配置的 sing-box check 后才替换，重启后不能稳定运行则自动恢复旧内核（切换期间节点会中断几秒）。面板只传递版本号，不传递任何代码或下载地址。<br>出于安全考虑，服务器默认不允许远程升级（这是仅有的会让服务器运行新代码的操作），需在VPS上 sb → 19 → 6 选择 4 单独开启；agent 1.4.0 以下不支持内核升级，需先升级脚本。</p>');
- var st={};
+ var st={},latestError='';
  function what(){return val('u-what')}
  function coreTarget(){var w=what(),L=S.latest||{};return w==='core'||w==='both'?L.core:w==='corepre'?L.corePre:w==='corever'?val('u-ver'):''}
  function needs(d){var w=what();if(!d)return false;if(w==='script')return needUpgrade(d);if(w==='both')return needUpgrade(d)||needCore(d,coreTarget());return needCore(d,coreTarget())}
- function rowState(s){var x=S.status[s.id];if(!x)return '<span class="muted">未知</span>';if(x.error)return '<span class="err">'+esc(x.error)+'</span>';return needs(x.data)?'<span class="err">需要升级</span>':'<span class="okc">已是目标版本</span>'}
+ function rowState(s){var x=S.status[s.id],L=S.latest||{},w=what();if(!x||!x.data&&!x.error)return '<span class="muted">服务器版本未知</span>';if(x.error)return '<span class="err">'+esc(x.error)+'</span>';if(latestError||L.stale||(w==='script'||w==='both')&&(!L.script||!L.agent||!x.data.script_version||!x.data.agent)||(w!=='script')&&(!coreTarget()||!coreOf(x.data)))return '<span class="muted">尚未确认最新版本</span>';return needs(x.data)?'<span class="err">需要升级</span>':'<span class="okc">已是目标版本</span>'}
  function draw(){var L=S.latest||{};
   $('u-ver').hidden=what()!=='corever';
-  $('u-latest').innerHTML=L.script?'GitHub 最新：脚本 <b>'+esc(L.script)+'</b> · agent <b>'+esc(L.agent)+'</b>　sing-box 正式版 <b>'+esc(L.core||'-')+'</b> · 测试版 <b>'+esc(L.corePre||'-')+'</b>'+(L.notes&&L.notes.length?'<details><summary>脚本更新内容</summary><pre class="link" style="white-space:pre-wrap">'+esc(L.notes.join('\\n'))+'</pre></details>':''):'<span class="muted">正在获取最新版本…</span>';
+  $('u-latest').innerHTML=(L.script?'GitHub 最新：脚本 <b>'+esc(L.script)+'</b> · agent <b>'+esc(L.agent)+'</b>　sing-box 正式版 <b>'+esc(L.core||'-')+'</b> · 测试版 <b>'+esc(L.corePre||'-')+'</b>'+(L.notes&&L.notes.length?'<details><summary>脚本更新内容</summary><pre class="link" style="white-space:pre-wrap">'+esc(L.notes.join('\\n'))+'</pre></details>':''):'<span class="muted">尚未取得最新版本</span>')+(latestError?'<p class="err">版本检查失败：'+esc(latestError)+'</p>':L.stale?'<p class="err">当前显示缓存版本，请点击「重新检查」确认。</p>':'');
   $('u-rows').innerHTML=S.servers.map(function(s){var x=S.status[s.id],d=x&&x.data;var chk=preset?preset.indexOf(s.id)>=0:needs(d);
    return '<tr><td><input type="checkbox" data-u="'+esc(s.id)+'"'+(chk?' checked':'')+'></td><td>'+esc(s.name)+(s.group?' <span class="small muted">'+esc(s.group)+'</span>':'')+'</td><td>'+esc(d?d.script_version||'-':'-')+'</td><td>'+esc(d?d.agent:'-')+'</td><td>'+esc(coreOf(d)||'-')+'</td><td id="u-s-'+esc(s.id)+'">'+(st[s.id]||rowState(s))+'</td></tr>'}).join('');
  }
- function refresh(force){$('u-st').textContent='检查中…';st={};return Promise.all([loadLatest(force).catch(function(e){$('u-latest').innerHTML='<span class="err">'+esc(e.message)+'</span>'})].concat(S.servers.map(function(s){return refreshOne(s.id)}))).then(function(){$('u-st').textContent='';draw()})}
+ function refresh(force){$('u-st').textContent='检查中…';st={};latestError='';return Promise.all([loadLatest(force).catch(function(e){latestError=e.message})].concat(S.servers.map(function(s){return refreshOne(s.id)}))).then(function(){$('u-st').textContent='';draw()})}
  function errText(e){return /未知操作/.test(e.message)?'agent 版本过旧，不支持此操作：请在VPS上运行 sb 选择 7 升级脚本':/upgrade/.test(e.message)?'该服务器未允许远程升级（安全默认）：如需开启，在VPS上运行 sb → 19 → 6 选择 4':e.message}
  function cellOf(s){return function(h){st[s.id]=h;var el=$('u-s-'+s.id);if(el)el.innerHTML=h}}
  function scriptOne(s){
