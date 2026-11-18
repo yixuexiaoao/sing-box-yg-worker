@@ -1,5 +1,7 @@
 # sing-box-yg-worker
 
+[维护手册与更新排查](MAINTENANCE.md)
+
 部署在 Cloudflare Workers 上的 **多服务器 Web 管理面板**，配合 [sing-box-yg](https://github.com/yixuexiaoao/sing-box-yg) 脚本的 API（一键安装第六步或 `sb` 主菜单 19 开启）使用。
 
 ## 功能

@@ -13,6 +13,8 @@ let fails = 0;
 const check = (cond, msg) => { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (!cond) fails++; };
 
 const mod = await loadWorker();
+const parsedReleases = mod.parseScriptReleases('\uFEFF  v26.11.19 更新内容：\r\n\r\n新增\r\n保留 v26.11.18 作为文字\r\n\r\nv26.11.4.4更新内容:\r\n修复\r\n');
+check(parsedReleases.length === 2 && parsedReleases[0].version === 'v26.11.19' && parsedReleases[0].notes.length === 2 && parsedReleases[1].version === 'v26.11.4.4', 'script changelog parses anchored multi-part versions and CRLF');
 const worker = mod.default;
 
 // 启动 sbagent API（完整权限）
@@ -400,12 +402,26 @@ try {
   // ---------- 升级 sing-box-yg
   r = await req('GET', '/api/latest');
   check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
+  check(r.body.data.releases.length === 2 && r.body.data.releases[1].version === 'v26.1' && r.body.data.releases[1].notes[0] === 'old', 'latest response includes all script release blocks');
   check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
   check(ghRange === 'bytes=0-8191', 'only the head of sbagent.py is fetched for its version');
   check(ghCacheMode === 'no-store', 'GitHub version fetch bypasses the subrequest cache');
   const gh = ghCalls;
   await req('GET', '/api/latest');
   check(ghCalls === gh, 'latest versions cached');
+  {
+    const legacy = JSON.parse(await env.SBYG_KV.get('latest'));
+    delete legacy.releases;
+    await env.SBYG_KV.put('latest', JSON.stringify(legacy));
+    r = await req('GET', '/api/latest');
+    check(Array.isArray(r.body.data.releases) && ghCalls > gh, 'legacy version cache refreshes release schema immediately');
+    delete legacy.releases;
+    await env.SBYG_KV.put('latest', JSON.stringify(legacy));
+    ghUnavailable = true;
+    r = await req('GET', '/api/latest');
+    check(r.body.data.stale === true && r.body.data.releases.length === 0, 'legacy cache fallback never treats notes as release history');
+    ghUnavailable = false;
+  }
   {
     // 缓存过期：本次请求即得到新版本，查询失败时明确标记之前成功的结果。
     const old = JSON.parse(await env.SBYG_KV.get('latest'));

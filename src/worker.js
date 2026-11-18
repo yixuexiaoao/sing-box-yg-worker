@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.1';
+const VERSION = '1.6.2';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -945,13 +945,32 @@ async function importData(env, data) {
 // 面板单独请求版本信息。缓存过期时等到更新结果，避免这一页一直显示旧版本。
 async function latestVersions(env, refresh) {
   const cached = refresh ? null : await kvJson(env, 'latest', null);
-  if (cached && Date.now() - cached.t < 1800000) return cached;
+  if (cached && Array.isArray(cached.releases) && Date.now() - cached.t < 1800000) return cached;
   try {
     return await fetchLatest(env);
   } catch (e) {
     if (!cached) throw e;
-    return { ...cached, stale: true };
+    return { ...cached, releases: Array.isArray(cached.releases) ? cached.releases : [], stale: true };
   }
+}
+
+export function parseScriptReleases(text) {
+  const releases = [];
+  let current = null;
+  for (const line of String(text).replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const header = line.match(/^\s*(v\d+(?:\.\d+){1,3})\s*更新内容\s*[：:]\s*$/);
+    if (header) {
+      current = { version: header[1], notes: [] };
+      releases.push(current);
+    } else if (current) {
+      current.notes.push(line);
+    }
+  }
+  for (const release of releases) {
+    while (release.notes.length && !release.notes[0].trim()) release.notes.shift();
+    while (release.notes.length && !release.notes[release.notes.length - 1].trim()) release.notes.pop();
+  }
+  return releases;
 }
 
 async function fetchLatest(env) {
@@ -962,11 +981,12 @@ async function fetchLatest(env) {
   };
   // sbagent.py 约 100KB，而版本号在文件开头：只取前 8KB（服务器不支持 Range 时返回整个文件，结果相同）
   const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py', 8191), coreVersions().catch(() => ({}))]);
-  const script = (ver.split('\n')[0] || '').split('更新内容')[0].trim();
-  const notes = ver.split(/\n(?=v\d)/)[0].split('\n').slice(1).filter((x) => x.trim()).slice(0, 12);
+  const releases = parseScriptReleases(ver);
+  const script = releases[0]?.version || '';
+  const notes = releases[0]?.notes.filter((x) => x.trim()) || [];
   const m = agent.match(/^VERSION[ \t]*=[ \t]*(["'])(\d+(?:\.\d+){1,3})\1/m);
   if (!/^v\d+(?:\.\d+){1,3}$/.test(script) || !m) throw httpError(502, 'GitHub 版本文件内容无法识别');
-  const out = { t: Date.now(), script, agent: m[2], notes, core: core.latest || '', corePre: core.prerelease || '' };
+  const out = { t: Date.now(), script, agent: m[2], notes, releases, core: core.latest || '', corePre: core.prerelease || '' };
   await env.SBYG_KV.put('latest', JSON.stringify(out)).catch(() => {});
   return out;
 }
@@ -1922,6 +1942,16 @@ function editServer(s,focusCycle){
 // ---------- 升级 sing-box-yg（脚本 sb.sh 与 sbagent）与 sing-box 内核
 function coreOf(d){return d&&d.version?String(d.version).trim():''}
 function needCore(d,target){var L=S.latest;target=target||(L&&L.core);return !!(target&&coreOf(d)&&coreOf(d)!==target)}
+function scriptUpgradeComplete(d,target){return !!(d&&target&&d.agent===target.agent&&(!target.script||d.script_version===target.script))}
+function releaseNotesHtml(preset){
+ var L=S.latest||{},list=preset?S.servers.filter(function(s){return preset.indexOf(s.id)>=0}):S.servers;
+ var versions=list.map(function(s){var st=S.status[s.id];return st&&st.data&&st.data.script_version}).filter(function(v){return /^v?\\d+(?:\\.\\d+){1,3}$/.test(String(v||''))});
+ if(!versions.length||!Array.isArray(L.releases))return '';
+ versions.sort(verCmp);var current=versions[0],mixed=versions.some(function(v){return verCmp(v,current)!==0});
+ var releases=L.releases.filter(function(r){return r&&/^v?\\d+(?:\\.\\d+){1,3}$/.test(String(r.version||''))&&verCmp(r.version,current)>0&&Array.isArray(r.notes)}).slice().sort(function(a,b){return verCmp(b.version,a.version)});
+ if(!releases.length)return '';
+ return '<details><summary>脚本更新内容 · 高于 '+esc(current)+(mixed?'（按当前范围最低版本）':'')+'</summary>'+releases.map(function(r){return '<h4>'+esc(r.version)+'</h4><pre class="link" style="white-space:pre-wrap">'+esc(r.notes.join('\\n'))+'</pre>'}).join('')+'</details>';
+}
 function upgradeDialog(preset){
  modal('检查更新 / 升级','<div id="u-latest" class="small"></div>'+
  '<div class="bar" style="margin:8px 0"><span class="small">升级内容：</span><select id="u-what"><option value="script">sing-box-yg 脚本与 agent</option><option value="core">sing-box 内核：最新正式版</option><option value="corepre">sing-box 内核：最新测试版</option><option value="corever">sing-box 内核：指定版本</option><option value="both">脚本与 agent + 内核最新正式版</option></select>'+
@@ -1936,7 +1966,7 @@ function upgradeDialog(preset){
  function rowState(s){var x=S.status[s.id],L=S.latest||{},w=what();if(!x||!x.data&&!x.error)return '<span class="muted">服务器版本未知</span>';if(x.error)return '<span class="err">'+esc(x.error)+'</span>';if(latestError||L.stale||(w==='script'||w==='both')&&(!L.script||!L.agent||!x.data.script_version||!x.data.agent)||(w!=='script')&&(!coreTarget()||!coreOf(x.data)))return '<span class="muted">尚未确认最新版本</span>';return needs(x.data)?'<span class="err">需要升级</span>':'<span class="okc">已是目标版本</span>'}
  function draw(){var L=S.latest||{};
   $('u-ver').hidden=what()!=='corever';
-  $('u-latest').innerHTML=(L.script?'GitHub 最新：脚本 <b>'+esc(L.script)+'</b> · agent <b>'+esc(L.agent)+'</b>　sing-box 正式版 <b>'+esc(L.core||'-')+'</b> · 测试版 <b>'+esc(L.corePre||'-')+'</b>'+(L.notes&&L.notes.length?'<details><summary>脚本更新内容</summary><pre class="link" style="white-space:pre-wrap">'+esc(L.notes.join('\\n'))+'</pre></details>':''):'<span class="muted">尚未取得最新版本</span>')+(latestError?'<p class="err">版本检查失败：'+esc(latestError)+'</p>':L.stale?'<p class="err">当前显示缓存版本，请点击「重新检查」确认。</p>':'');
+  $('u-latest').innerHTML=(L.script?'GitHub 最新：脚本 <b>'+esc(L.script)+'</b> · agent <b>'+esc(L.agent)+'</b>　sing-box 正式版 <b>'+esc(L.core||'-')+'</b> · 测试版 <b>'+esc(L.corePre||'-')+'</b>'+releaseNotesHtml(preset):'<span class="muted">尚未取得最新版本</span>')+(latestError?'<p class="err">版本检查失败：'+esc(latestError)+'</p>':L.stale?'<p class="err">当前显示缓存版本，请点击「重新检查」确认。</p>':'');
   $('u-rows').innerHTML=S.servers.map(function(s){var x=S.status[s.id],d=x&&x.data;var chk=preset?preset.indexOf(s.id)>=0:needs(d);
    return '<tr><td><input type="checkbox" data-u="'+esc(s.id)+'"'+(chk?' checked':'')+'></td><td>'+esc(s.name)+(s.group?' <span class="small muted">'+esc(s.group)+'</span>':'')+'</td><td>'+esc(d?d.script_version||'-':'-')+'</td><td>'+esc(d?d.agent:'-')+'</td><td>'+esc(coreOf(d)||'-')+'</td><td id="u-s-'+esc(s.id)+'">'+(st[s.id]||rowState(s))+'</td></tr>'}).join('');
  }
@@ -1949,7 +1979,7 @@ function upgradeDialog(preset){
    var target=r.to.agent;cell('已替换为 '+esc(r.to.script)+' / agent '+esc(target)+'，等待重启…');
    var t0=Date.now();
    return new Promise(function(done){(function poll(){setTimeout(function(){call(s.id,'status').then(function(d){
-     if(d.agent===target){S.status[s.id]={data:d};cell('<span class="okc">✔ 脚本已升级到 '+esc(d.script_version)+' / agent '+esc(d.agent)+'</span>');done(true)}
+     if(scriptUpgradeComplete(d,r.to)){S.status[s.id]={data:d};cell('<span class="okc">✔ 脚本已升级到 '+esc(d.script_version)+' / agent '+esc(d.agent)+'</span>');draw();done(true)}
      else if(Date.now()-t0>90000){cell('<span class="err">重启后版本仍为 '+esc(d.agent)+'，可能已自动回滚，请在VPS上查看</span>');done(false)}else poll();
     },function(){if(Date.now()-t0>90000){cell('<span class="err">升级后无法连接，请在VPS上检查 sbagent 服务</span>');done(false)}else poll()})},3000)})()});
   },function(e){cell('<span class="err">'+esc(errText(e))+'</span>');return false});

@@ -17,8 +17,32 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, S } = sandbox.renderers;
+
+assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
+assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);
+assert.equal(scriptUpgradeComplete({ agent: '1.4.6' }, { agent: '1.4.6' }), true);
+
+S.servers = [{ id: 'old' }, { id: 'current' }, { id: 'unknown' }];
+S.status = { old: { data: { script_version: 'v26.11.4.3', agent: '1.4.6' } }, current: { data: { script_version: 'v26.11.19' } } };
+S.latest = { releases: [
+  { version: 'v26.11.19', notes: ['newest <release>'] },
+  { version: 'v26.11.4.4', notes: ['patch release'] },
+  { version: 'v26.11.4.3', notes: ['installed release'] },
+  { version: 'v26.11.4.2', notes: ['older release'] },
+] };
+const recentNotes = releaseNotesHtml(['old']);
+assert.ok(recentNotes.includes('newest &lt;release&gt;') && recentNotes.includes('patch release'));
+assert.ok(!recentNotes.includes('installed release') && !recentNotes.includes('older release'));
+assert.ok(!recentNotes.includes('最低版本'));
+assert.ok(releaseNotesHtml().includes('按当前范围最低版本'));
+assert.equal(releaseNotesHtml(['current']), '');
+assert.equal(releaseNotesHtml(['unknown']), '');
+S.latest = { notes: ['legacy notes'] };
+assert.equal(releaseNotesHtml(['old']), '');
+S.servers = [];
+S.status = {};
 
 const upgradeServer = { id: 'upgrade', name: '待更新', host: '192.0.2.1', port: 1234, cycle: { mode: 'off' } };
 S.latest = { script: 'v26.11.19', agent: '1.4.6' };
