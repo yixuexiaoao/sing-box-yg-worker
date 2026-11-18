@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.9';
+const VERSION = '1.5.10';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -256,10 +256,31 @@ function httpError(status, message) {
   return e;
 }
 
-async function readJson(request) {
+async function readJson(request, limit) {
   try {
-    return await request.json();
-  } catch (_) {
+    if (!limit) return await request.json();
+    if (Number(request.headers.get('content-length')) > limit) throw httpError(413, '请求体过大');
+    if (!request.body) throw httpError(400, '请求体不是有效的 JSON');
+    const reader = request.body.getReader();
+    const bytes = new Uint8Array(limit);
+    let length = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (length + value.byteLength > limit) {
+          reader.cancel().catch(() => {});
+          throw httpError(413, '请求体过大');
+        }
+        bytes.set(value, length);
+        length += value.byteLength;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return JSON.parse(dec.decode(bytes.subarray(0, length)));
+  } catch (e) {
+    if (e.status) throw e;
     throw httpError(400, '请求体不是有效的 JSON');
   }
 }
@@ -393,9 +414,9 @@ async function tgSend(settings, text) {
       body: JSON.stringify({ chat_id: t.chat, text: '[' + settings.title + ']\n' + text, disable_web_page_preview: true }),
     });
     const j = await r.json().catch(() => ({}));
-    return j.ok ? { ok: true } : { ok: false, error: j.description || 'HTTP ' + r.status };
-  } catch (e) {
-    return { ok: false, error: e.message };
+    return j.ok ? { ok: true } : { ok: false, error: 'Telegram 返回 HTTP ' + r.status };
+  } catch (_) {
+    return { ok: false, error: '无法连接 Telegram，请稍后重试' };
   }
 }
 
@@ -493,7 +514,7 @@ async function login(request, env, ctx, who, settings) {
   const failKey = failKeyOf(who.ip);
   const fails = parseInt((await env.SBYG_KV.get(failKey)) || '0', 10);
   if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '登录失败次数过多，请15分钟后再试');
-  const body = (await readJson(request)) || {};
+  const body = (await readJson(request, 16 * 1024)) || {};
   const bad = async (msg) => {
     await env.SBYG_KV.put(failKey, String(fails + 1), { expirationTtl: 900 });
     note(false, msg);
@@ -514,7 +535,7 @@ async function login(request, env, ctx, who, settings) {
 }
 
 async function checkSession(request, env) {
-  const m = (request.headers.get('cookie') || '').match(new RegExp('(?:^|;\\s*)' + COOKIE + '=(\\d+)\\.(\\d+)\\.([\\w-]+)'));
+  const m = (request.headers.get('cookie') || '').match(new RegExp('(?:^|;\\s*)' + COOKIE + '=(\\d+)\\.(\\d+)\\.([A-Za-z0-9_-]{43})(?=\\s*(?:;|$))'));
   if (!m || parseInt(m[1], 10) < Date.now() / 1000) return false;
   if (m[2] !== ((await env.SBYG_KV.get('sessver')) || '0')) return false;
   let sig;
@@ -546,6 +567,7 @@ async function requireTotp(env, settings, code, what, note, who) {
 }
 
 async function totpRoute(op, request, env, settings, note, who) {
+  if (settings.totp && (op === 'setup' || op === 'enable')) throw httpError(409, '二次验证已开启，请先验证身份并关闭现有配置');
   const body = (await readJson(request)) || {};
   if (op === 'setup') {
     const secret = b32encode(crypto.getRandomValues(new Uint8Array(20)));
@@ -556,7 +578,10 @@ async function totpRoute(op, request, env, settings, note, who) {
   if (op === 'enable') {
     const secret = await getSecret(env, 'totp_pending');
     if (!secret) throw httpError(400, '请先生成密钥（10分钟内有效）');
-    if (!(await totpVerify(secret, String(body.code || ''), env))) throw httpError(400, '验证码错误，请检查手机时间');
+    if (!(await guardedCheck(env, who, async () => (await passwordOk(env, body.password)) && (await totpVerify(secret, String(body.code || ''), env))))) {
+      note('panel', '开启二次验证', { ok: false, msg: '密码或验证码错误' });
+      throw httpError(403, '密码或验证码错误');
+    }
     await env.SBYG_KV.put('totp_secret', await encSecret(env, secret));
     await env.SBYG_KV.delete('totp_pending');
     await putSettings(env, { ...settings, totp: true });
@@ -644,17 +669,23 @@ function parseIp(ip) {
   const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
   const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
   if (fill < 0 || (halves.length === 1 && head.length !== 8)) return null;
+  if (halves.length === 2 && fill === 0) return null;
   const groups = head.concat(new Array(fill).fill('0'), tail);
   if (groups.some((g) => !/^[0-9a-f]{1,4}$/i.test(g))) return null;
-  return { bits: 128, v: groups.reduce((a, g) => (a << 16n) | BigInt(parseInt(g, 16)), 0n) };
+  const v = groups.reduce((a, g) => (a << 16n) | BigInt(parseInt(g, 16)), 0n);
+  if ((v >> 32n) === 0xffffn) return { bits: 32, v: v & 0xffffffffn };
+  return { bits: 128, v };
 }
 
 function parseCidr(c) {
-  const [net, len] = String(c).split('/');
+  const parts = String(c).split('/');
+  const [net, len] = parts;
+  if (parts.length > 2 || (len !== undefined && !/^\d{1,3}$/.test(len))) return null;
   const n = parseIp(net);
   if (!n) return null;
-  const l = len === undefined ? n.bits : Number(len);
-  if (!Number.isInteger(l) || l < 0 || l > n.bits) return null;
+  let l = len === undefined ? n.bits : Number(len);
+  if (n.bits === 32 && net.includes(':') && l >= 96 && l <= 128) l -= 96;
+  if (l > n.bits) return null;
   return { ...n, len: l };
 }
 
@@ -839,9 +870,11 @@ function validServer(s) {
   if (!/^[A-Za-z0-9.:-]{1,253}$/.test(host)) throw httpError(400, '服务器地址格式错误：请填写服务器的公网IP或域名');
   // Worker 只能连接公网地址：IPv4/IPv6 或带点的域名。不带点的主机名（如 VM 名称 free-e2micro）与内网地址在公网上无法连接
   const v4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host), v6 = host.includes(':');
+  const ip = v4 || v6 ? parseIp(host) : null;
+  if ((v4 || v6) && !ip) throw httpError(400, '服务器 IP 地址格式错误');
   if (!globalThis.__SBYG_ALLOW_PRIVATE && !v4 && !v6 && !host.includes('.')) throw httpError(400, '服务器地址「' + host + '」是主机名，Worker 无法连接：请填写服务器的公网IP或域名（谷歌云在控制台「外部IP」一栏查看）');
-  if (!globalThis.__SBYG_ALLOW_PRIVATE && v4 && /^(10|127|0|169\.254|192\.168|172\.(1[6-9]|2\d|3[01])|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])|2(2[4-9]|[3-5]\d))\./.test(host)) throw httpError(400, '「' + host + '」是内网IP，Worker 无法连接：请填写服务器的公网IP（谷歌云/AWS 等网卡上只有内网IP，公网IP在控制台查看）');
-  if (!globalThis.__SBYG_ALLOW_PRIVATE && v6 && /^(fe80|fc|fd|ff)|^::1?$|^::ffff:/i.test(host)) throw httpError(400, '「' + host + '」不是公网IPv6地址');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v4 && !isPublicIp(host)) throw httpError(400, '「' + host + '」是内网IP，Worker 无法连接：请填写服务器的公网IP');
+  if (!globalThis.__SBYG_ALLOW_PRIVATE && v6 && (ip.bits !== 128 || !isPublicIp(host))) throw httpError(400, '「' + host + '」不是公网IPv6地址');
   if (!(port > 0 && port < 65536) || port === 25) throw httpError(400, '端口错误');
   if (!/^\/[A-Za-z0-9/_-]{0,64}$/.test(path)) throw httpError(400, 'API路径格式错误');
   return {
@@ -960,7 +993,7 @@ export function isPublicIp(ip) {
   const a = parseIp(ip);
   if (!a) return false;
   const priv = a.bits === 32
-    ? ['10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10', '0.0.0.0/8', '224.0.0.0/4']
+    ? ['10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10', '0.0.0.0/8', '224.0.0.0/4', '240.0.0.0/4']
     : ['::1/128', 'fc00::/7', 'fe80::/10', '::/128', 'ff00::/8'];
   return !priv.some((c) => ipInCidr(ip, c));
 }
@@ -1761,6 +1794,7 @@ function updateSummary(){
  el.innerHTML='<div class="card fleet-summary"><div class="fleet-count"><b>'+list.length+'</b><span class="muted small">台服务器</span></div><div class="fleet-health"><div class="health-track" role="img" aria-label="'+esc(counts.map(function(n,i){return labels[i]+' '+n+' 台'}).join('，'))+'">'+counts.map(function(n,i){return n?'<i style="width:'+(n/Math.max(1,list.length)*100)+'%;background:'+colors[i]+'"></i>':''}).join('')+'</div><div class="health-legend">'+counts.map(function(n,i){return '<span><i class="dot" style="background:'+colors[i]+'"></i> '+labels[i]+' <b>'+n+'</b></span>'}).join('')+'</div></div></div>';
 }
 var PERM_NAMES={read:'只读',links:'节点链接',manage:'管理',upgrade:'远程升级'};
+function permissionText(perms){return Array.isArray(perms)?esc(perms.map(function(p){return Object.hasOwn(PERM_NAMES,p)?PERM_NAMES[p]:p}).join('、')):'-'}
 function day(t){return fmtTime(t).slice(0,10)}
 function serverMetrics(d){
  var mem=d.mem||{},total=Number(mem.MemTotal),available=Number(mem.MemAvailable),hasMem=Number.isFinite(total)&&total>0&&mem.MemAvailable!=null&&Number.isFinite(available);
@@ -1800,7 +1834,7 @@ function cardHtml(s){
   '<span>运行</span><span>'+fmtUp(d.uptime)+'，负载 '+esc((d.load||[]).join(' '))+(d.mem&&d.mem.MemTotal?'，内存 '+fmtBytes(d.mem.MemTotal-d.mem.MemAvailable)+'/'+fmtBytes(d.mem.MemTotal):'')+'</span>'+
   '<span>日志</span><span>'+(d.log&&d.log.enabled?'已开启 '+fmtBytes(d.log.size)+(d.log.archives?'（归档'+d.log.archives+'份）':''):'<span class="err">未开启</span>')+'</span>'+
   '<span>流量</span><span>'+(tr.enabled?'统计中 '+fmtBytes(tr.db_size):'<span class="muted">未开启</span>')+'</span>'+cycleHtml(s)+
-  '<span>API权限</span><span>'+(ap.perms?ap.perms.map(function(p){return PERM_NAMES[p]||p}).join('、'):'-')+(ap.allow&&ap.allow.length?' · IP白名单':'')+'</span>'+
+  '<span>API权限</span><span>'+permissionText(ap.perms)+(ap.allow&&ap.allow.length?' · IP白名单':'')+'</span>'+
   '<span>重置</span><span>'+(d.last_reset?esc(d.last_reset.time)+' ('+esc((d.last_reset.items||[]).join(','))+')':'从未')+(d.schedule?' · 已设定时':'')+(d.leak&&d.leak.enabled?' · 泄露检测':'')+'</span>'+
   (d.argo&&(d.argo.temp||d.argo.fixed)?'<span>Argo</span><span>'+esc(d.argo.fixed||d.argo.temp)+'</span>':'')+'</div></details>';
  }
@@ -2066,7 +2100,7 @@ function settingsDialog(s){
   '<div class="section"><h3>泄露检测（每小时一次）</h3>'+
   '<div class="bar small"><label><input type="checkbox" id="g-len"'+(lk.enabled?' checked':'')+'>开启</label> 最近 <input id="g-lh" type="number" style="width:70px" value="'+esc(lk.hours||24)+'"> 小时内，不同源IP超过 <input id="g-lt" type="number" style="width:70px" value="'+esc(lk.threshold||10)+'"> 个时'+
   '<select id="g-la"><option value="notify"'+(lk.action!=='reset'?' selected':'')+'>仅TG通知</option><option value="reset"'+(lk.action==='reset'?' selected':'')+'>自动重置并TG推送</option></select><button id="g-lsave" class="primary">保存</button><button id="g-lcheck">立即检测</button></div><div id="g-lres" class="small" style="margin-top:6px"></div></div>'+
-  '<p class="small muted">API权限：'+(d.api&&d.api.perms?d.api.perms.map(function(p){return PERM_NAMES[p]||p}).join('、'):'-')+(d.api&&d.api.allow&&d.api.allow.length?'；IP白名单：'+esc(d.api.allow.join(', ')):'')+'。权限与白名单只能在VPS上通过 sb → 19 修改。</p>';
+ '<p class="small muted">API权限：'+permissionText(d.api&&d.api.perms)+(d.api&&d.api.allow&&d.api.allow.length?'；IP白名单：'+esc(d.api.allow.join(', ')):'')+'。权限与白名单只能在VPS上通过 sb → 19 修改。</p>';
   function act(a,p,msg,reload){return call(s.id,a,p).then(function(r){toast(msg);refreshOne(s.id);if(reload)settingsDialog(s);return r}).catch(function(e){toast(e.message)})}
   bind($('g-out'),'[data-do]',function(b){var a=b.getAttribute('data-do');if(a==='clearlog'&&!confirm('清空全部日志（含归档）？'))return;act(a,{},'已完成',true)});
   bind($('g-out'),'[data-sch]',function(b){act('schedule',{mode:b.getAttribute('data-sch'),items:'all'},'已保存',true)});
@@ -2357,11 +2391,17 @@ document.addEventListener('keydown',function(e){
  var target;if(e.key==='ArrowRight')target=bar.nextElementSibling;else if(e.key==='ArrowLeft')target=bar.previousElementSibling;else if(e.key==='Home')target=bar.parentNode.firstElementChild;else if(e.key==='End')target=bar.parentNode.lastElementChild;else return;
  e.preventDefault();if(target){target.focus({preventScroll:true});target.scrollIntoView({block:'nearest',inline:'nearest'})}
 });
+function csvCell(v){
+ if(typeof v==='number'&&Number.isFinite(v))return String(v);
+ var s=String(v==null?'':v);
+ if(/^[\\t\\r\\n]|^\\s*[=+@－＝＋＠-]/.test(s))s='’'+s;
+ return '"'+s.replace(/"/g,'""')+'"';
+}
 function exportCsv(){
  if(!TS.rows||!TS.rows.length)return toast('请先查询');
- var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0,q=function(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"'};
+ var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0;
  var lines=['server,key,'+(ipCol?'location,isp,':'')+'upload,download,total,conns,ips,hosts'].concat(TS.rows.map(function(x){var ip=ipCol?ipOf(x.key,TS.group):null,g=ip?GEO[ip]:null;
-  return [q(x.srv?x.srv.name:x.servers.join('/')),q(x.key)].concat(ipCol?[q(geoText(g)),q(geoIsp(g))]:[]).concat([x.up,x.down,x.up+x.down,x.conns,x.ips,x.hosts]).join(',')}));
+  return [x.srv?x.srv.name:x.servers.join('/'),x.key].concat(ipCol?[geoText(g),geoIsp(g)]:[]).concat([x.up,x.down,x.up+x.down,x.conns,x.ips,x.hosts]).map(csvCell).join(',')}));
  var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\\ufeff'+lines.join('\\n')],{type:'text/csv'}));a.download='traffic-'+TS.group+'.csv';a.click();
 }
 
@@ -2533,8 +2573,8 @@ function viewSettings(){
 function totpSetup(){
  api('/api/totp/setup',{body:{}}).then(function(j){
   modal('开启二次验证','<p class="small">在 Google Authenticator / Microsoft Authenticator / 1Password 等应用中添加账户，手动输入以下密钥（基于时间）：</p><div class="link" style="font-size:16px;letter-spacing:2px">'+esc(j.secret)+'</div>'+
-  '<p class="small muted">或复制配置链接：<a data-copy="'+esc(j.uri)+'">复制 otpauth 链接</a></p><div class="bar"><input id="t-code" placeholder="输入应用中显示的6位验证码"><button class="primary" id="t-on">验证并开启</button></div><p class="err small" id="t-err"></p>',true);
-  $('t-on').addEventListener('click',function(){api('/api/totp/enable',{body:{code:val('t-code')}}).then(function(){closeModal();toast('二次验证已开启');viewSettings()}).catch(function(e){$('t-err').textContent=e.message})});
+  '<p class="small muted">或复制配置链接：<a data-copy="'+esc(j.uri)+'">复制 otpauth 链接</a></p><div class="field"><input type="password" id="t-pw" autocomplete="current-password" placeholder="管理密码" aria-label="管理密码"></div><div class="bar"><input id="t-code" inputmode="numeric" autocomplete="one-time-code" placeholder="输入应用中显示的6位验证码" aria-label="二次验证码"><button class="primary" id="t-on">验证并开启</button></div><p class="err small" id="t-err"></p>',true);
+  $('t-on').addEventListener('click',function(){api('/api/totp/enable',{body:{password:$('t-pw').value,code:val('t-code')}}).then(function(){closeModal();toast('二次验证已开启');viewSettings()}).catch(function(e){$('t-err').textContent=e.message})});
  }).catch(function(e){toast(e.message)});
 }
 

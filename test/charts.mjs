@@ -15,8 +15,14 @@ const elements = { summary: { innerHTML: '' } };
 const sandbox = {
   document: { getElementById: (id) => elements[id] || {}, addEventListener() {} },
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,updateSummary,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, updateSummary, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,updateSummary,csvCell,permissionText,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, updateSummary, csvCell, permissionText, S } = sandbox.renderers;
+
+assert.equal(csvCell(' @示例'), '"’ @示例"');
+assert.equal(csvCell('＝示例'), '"’＝示例"');
+assert.equal(csvCell('节点, "名称"'), '"节点, ""名称"""');
+assert.equal(csvCell(25), '25');
+assert.equal(permissionText(['read', '<未知权限>']), '只读、&lt;未知权限&gt;');
 
 assert.equal(chart([]), '');
 const zero = chart([{ key: '2026-11-18', up: 0, down: 0 }]);

@@ -37,6 +37,7 @@ const env0 = { ...process.env, SB_DIR: sbDir, SB_WEBDIR: path.join(sbDir, '..', 
 const realFetch = globalThis.fetch;
 let geoCalls = 0, geoAsked = [];
 globalThis.fetch = async (u, opt) => {
+  if (String(u).startsWith('https://api.telegram.org/')) throw new Error('mock provider diagnostics');
   if (String(u).startsWith('http://ip-api.com/batch')) {
     geoCalls++;
     const ips = JSON.parse(opt.body);
@@ -138,6 +139,9 @@ try {
   }
   cookie = '__Host-sbyg_s=9999999999.0.abcde';
   check((await req('GET', '/api/me')).status === 401, 'malformed cookie -> 401');
+  cookie = goodCookie + '=';
+  check((await req('GET', '/api/me')).status === 401, 'session cookie rejects trailing bytes');
+  check((await post('/api/login', { password: 'x'.repeat(17000) })).status === 413, 'login rejects oversized JSON without content-length');
   cookie = goodCookie;
   r = await worker.fetch(new Request('https://panel.example/api/settings', { method: 'POST', headers: { ...X, cookie }, body: '{bad' }), env, ctx);
   check(r.status === 400, 'invalid JSON body -> 400');
@@ -317,6 +321,11 @@ try {
   r = await req('GET', '/api/me');
   check(JSON.stringify(r.body).indexOf('ABCDEFGHIJKLMNOP') < 0, 'TG token not exposed in /api/me');
   check(mod.ipInCidr('2001:db8::1', '2001:db8::/32') && !mod.ipInCidr('2001:db9::1', '2001:db8::/32') && mod.ipInCidr('::ffff:10.1.2.3', '10.0.0.0/8'), 'CIDR matching v4/v6/mapped');
+  check(!mod.ipInCidr('192.0.2.1', '192.0.2.0/') && !mod.ipInCidr('192.0.2.1', '192.0.2.0/24/'), 'invalid CIDR prefixes rejected');
+  check(mod.ipInCidr('::ffff:c000:201', '::ffff:c000:200/120'), 'mapped IPv6 prefix keeps IPv4 subnet matching');
+  check(!mod.isPublicIp('::ffff:a01:203') && !mod.isPublicIp('fe90::1') && mod.isPublicIp('2606:4700::1111'), 'private IPv6 classification handles mapped and link-local addresses');
+  r = await post('/api/settings/tgtest', {});
+  check(r.status === 400 && !r.body.error.includes('mock provider diagnostics'), 'Telegram diagnostics stay out of API responses');
   fromIp = '203.0.113.9';
   r = await post('/api/login', { password: 'pw-123456' });
   check(r.status === 403, 'login from IP outside allowlist -> 403');
@@ -328,10 +337,12 @@ try {
   r = await post('/api/totp/setup', {});
   const secret = r.body.secret;
   check(/^[A-Z2-7]{32}$/.test(secret) && r.body.uri.startsWith('otpauth://totp/'), 'TOTP secret generated');
-  check((await post('/api/totp/enable', { code: '000000' })).status === 400, 'TOTP enable rejects wrong code');
   const code = await mod.totpCode(secret, Math.floor(Date.now() / 30000));
-  r = await post('/api/totp/enable', { code });
-  check(r.status === 200, 'TOTP enabled with valid code');
+  check((await post('/api/totp/enable', { code })).status === 403, 'TOTP enable requires password');
+  check((await post('/api/totp/enable', { password: 'pw-123456', code: 'invalid' })).status === 403, 'TOTP enable rejects invalid codes');
+  r = await post('/api/totp/enable', { password: 'pw-123456', code });
+  check(r.status === 200, 'TOTP enabled with valid password and code');
+  check((await post('/api/totp/setup', {})).status === 409 && (await post('/api/totp/enable', { password: 'pw-123456', code })).status === 409, 'active TOTP protected against replacement');
   check(await mod.totpCode('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 1) === '287082', 'TOTP matches RFC 6238 test vector');
   cookie = '';
   r = await post('/api/login', { password: 'pw-123456' });
