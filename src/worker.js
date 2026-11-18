@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.8';
+const VERSION = '1.5.9';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -1603,7 +1603,22 @@ label{display:inline-flex;gap:4px;align-items:center}
 .meter{height:6px;background:var(--chip);border-radius:3px;min-width:80px}
 .meter i{display:block;height:6px;border-radius:3px;background:var(--bar)}
 svg text{fill:var(--muted);font-size:10px}
-@media (max-width:600px){.grid{grid-template-columns:1fr}main{padding:10px}header{padding:8px 10px}}
+.fleet-summary{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin-bottom:12px}
+.fleet-count{display:flex;align-items:baseline;gap:6px}.fleet-count b{font-size:28px;line-height:1.2}
+.fleet-health{flex:1;min-width:200px}.health-track{height:10px;display:flex;overflow:hidden;border-radius:5px;background:var(--chip);margin-bottom:6px}
+.health-track i{height:100%}.health-legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px}
+.server-head{flex-wrap:wrap}.server-address{font-weight:normal;overflow-wrap:anywhere;max-width:100%}
+.server-metrics{display:flex;align-items:center;gap:16px;padding:12px 0}.memory-dial{width:66px;height:66px;flex:none;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--accent) var(--usage),var(--chip) 0)}
+.memory-dial>span{width:52px;height:52px;border-radius:50%;background:var(--card);display:grid;place-content:center;text-align:center;font-size:14px;font-weight:600}.memory-dial small{font-size:10px;font-weight:normal;color:var(--muted)}
+.metric-values{display:flex;flex:1;flex-wrap:wrap;gap:8px 18px}.metric-values b{display:block;font-size:16px}.metric-values small{color:var(--muted);font-size:11px}
+.server-details{margin-top:8px}.server-details>summary{cursor:pointer;font-size:12px;color:var(--muted)}
+.cycle-visual{padding:8px 0;border-top:1px solid var(--line)}.cycle-visual .bar{justify-content:space-between}.cycle-visual .meter{height:8px;margin:6px 0}.cycle-visual .meter i{height:8px}
+.traffic-chart{margin-bottom:10px;min-width:0}.chart-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:12px}.chart-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}.chart-up{background:var(--accent)}.chart-down{background:var(--bar)}
+.chart-readout{min-height:26px;margin:8px 0 4px;font-size:12px;overflow-wrap:anywhere}.chart-layout{display:flex;gap:8px}.chart-scale{width:54px;flex:none;display:flex;flex-direction:column;justify-content:space-between;padding-bottom:24px;font-size:10px;color:var(--muted)}
+.chart-scroll{overflow-x:auto;flex:1;min-width:0}.chart-columns{display:flex;height:180px;min-width:100%;border-bottom:1px solid var(--line);background:linear-gradient(to top,transparent calc(50% - 1px),var(--line) 50%,transparent calc(50% + 1px))}
+.chart-column{flex:1;min-width:24px;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;padding:0 3px;position:relative;border:0;border-radius:0;background:transparent}.chart-column:hover,.chart-column:focus-visible{background:var(--chip);outline:2px solid var(--accent);outline-offset:-2px}
+.chart-stack{height:calc(100% - 24px);width:100%;max-width:42px;display:flex;flex-direction:column;justify-content:flex-end}.chart-stack i{display:block;width:100%;flex:none}.chart-label{height:24px;flex:none;font-size:10px;line-height:24px;white-space:nowrap;color:var(--muted)}
+@media (max-width:600px){.grid{grid-template-columns:1fr}main{padding:10px}header{padding:8px 10px}.chart-column:nth-child(even) .chart-label{visibility:hidden}}
 </style>
 </head>
 <body>
@@ -1691,7 +1706,7 @@ function go(tab){S.tab=tab;document.querySelectorAll('#nav [data-tab]').forEach(
 function groupNames(){var g={};S.servers.forEach(function(s){g[s.group||'']=(g[s.group||'']||0)+1});return Object.keys(g).sort(function(a,b){return a===''?1:b===''?-1:(a<b?-1:1)}).map(function(k){return [k,g[k]]})}
 function viewServers(){
  $('view').innerHTML='<div class="bar" style="margin-bottom:8px"><button class="primary" id="b-add">添加服务器</button><button id="b-refresh">全部刷新</button>'+
- '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-upg">检查更新</button><button id="b-io">导入/导出</button><span id="summary" class="muted small"></span></div><div id="b-notice"></div>'+
+ '<button id="b-resetall" class="danger">一键全部重置参数</button><button id="b-batch">批量操作</button><button id="b-groups">分组管理</button><button id="b-upg">检查更新</button><button id="b-io">导入/导出</button></div><div id="summary"></div><div id="b-notice"></div>'+
  '<div class="bar tabs" id="gchips" style="margin-bottom:10px"></div><div id="grid"></div>';
  $('b-add').addEventListener('click',function(){editServer()});
  $('b-refresh').addEventListener('click',refreshAll);
@@ -1722,6 +1737,8 @@ function scheduleRender(){if(renderPending)return;renderPending=true;var done=fa
  requestAnimationFrame(run);setTimeout(run,100)}
 function renderGrid(){
  var g=$('grid');if(!g)return;
+ var openDetails={};g.querySelectorAll('details[data-server-details][open]').forEach(function(el){openDetails[el.getAttribute('data-server-details')]=true});
+ var focused=document.activeElement,focusAttrs=['data-act','data-id','data-sel','data-server-details'],focusValues=focused&&g.contains(focused)?focusAttrs.map(function(k){return focused.getAttribute(k)}):null;
  var groups=groupNames();
  if(S.groupFilter!=null&&!groups.some(function(x){return x[0]===S.groupFilter}))S.groupFilter=null;
  $('gchips').innerHTML=groups.length>1||(groups[0]&&groups[0][0])?'<button data-g="*"'+(S.groupFilter==null?' class="on"':'')+'>全部 ('+S.servers.length+')</button>'+groups.map(function(x){return '<button data-g="'+esc(x[0])+'"'+(S.groupFilter===x[0]?' class="on"':'')+'>'+esc(x[0]||'未分组')+' ('+x[1]+')</button>'}).join(''):'';
@@ -1731,13 +1748,34 @@ function renderGrid(){
  if(S.groupFilter==null&&groups.length>1){
   g.innerHTML=groups.map(function(x){var ss=list.filter(function(s){return (s.group||'')===x[0]});return '<div class="section"><h3>'+esc(x[0]||'未分组')+' <span class="muted small">'+ss.length+' 台</span></h3><div class="grid">'+ss.map(cardHtml).join('')+'</div></div>'}).join('');
  }else g.innerHTML='<div class="grid">'+list.map(cardHtml).join('')+'</div>';
+ g.querySelectorAll('details[data-server-details]').forEach(function(el){el.open=!!openDetails[el.getAttribute('data-server-details')]});
+ if(focusValues){var candidates=g.querySelectorAll('[data-act],input[data-sel],[data-server-details]>summary');for(var ci=0;ci<candidates.length;ci++){var candidate=candidates[ci];if(focusAttrs.every(function(k,i){return candidate.getAttribute(k)===focusValues[i]})){candidate.focus({preventScroll:true});break}}}
  bind(g,'[data-act]',function(b){onAction(b.getAttribute('data-act'),b.getAttribute('data-id'))});
  g.querySelectorAll('input[data-sel]').forEach(function(c){c.addEventListener('change',function(){S.selected[c.getAttribute('data-sel')]=c.checked})});
  updateSummary();
 }
-function updateSummary(){var el=$('summary');if(!el)return;var on=0,act=0;S.servers.forEach(function(s){var st=S.status[s.id];if(st&&st.data){on++;if(st.data.active)act++}});el.textContent='共 '+S.servers.length+' 台，在线 '+on+' 台，Sing-box运行中 '+act+' 台'}
+function updateSummary(){
+ var el=$('summary');if(!el)return;var list=visibleServers(),counts=[0,0,0,0];
+ list.forEach(function(s){var st=S.status[s.id];counts[!st?3:st.error?2:st.data&&st.data.active?0:1]++});
+ var labels=['运行中','服务停止','离线','待检测'],colors=['var(--ok)','var(--warn)','var(--bad)','var(--muted)'];
+ el.innerHTML='<div class="card fleet-summary"><div class="fleet-count"><b>'+list.length+'</b><span class="muted small">台服务器</span></div><div class="fleet-health"><div class="health-track" role="img" aria-label="'+esc(counts.map(function(n,i){return labels[i]+' '+n+' 台'}).join('，'))+'">'+counts.map(function(n,i){return n?'<i style="width:'+(n/Math.max(1,list.length)*100)+'%;background:'+colors[i]+'"></i>':''}).join('')+'</div><div class="health-legend">'+counts.map(function(n,i){return '<span><i class="dot" style="background:'+colors[i]+'"></i> '+labels[i]+' <b>'+n+'</b></span>'}).join('')+'</div></div></div>';
+}
 var PERM_NAMES={read:'只读',links:'节点链接',manage:'管理',upgrade:'远程升级'};
 function day(t){return fmtTime(t).slice(0,10)}
+function serverMetrics(d){
+ var mem=d.mem||{},total=Number(mem.MemTotal),available=Number(mem.MemAvailable),hasMem=Number.isFinite(total)&&total>0&&mem.MemAvailable!=null&&Number.isFinite(available);
+ var used=hasMem?Math.max(0,Math.min(total,total-available)):0,pct=hasMem?Math.round(used/total*100):null;
+ return '<div class="server-metrics"><div class="memory-dial" style="--usage:'+(pct||0)+'%" role="img" aria-label="'+esc(hasMem?'内存使用 '+pct+'%，'+fmtBytes(used)+' / '+fmtBytes(total):'内存数据不可用')+'"><span>'+(hasMem?pct+'%':'—')+'<small>内存</small></span></div><div class="metric-values"><div><b>'+esc(fmtUp(d.uptime))+'</b><small>运行时间</small></div><div><b>'+esc(d.load&&d.load[0]!=null?d.load[0]:'—')+'</b><small>1 分钟负载</small></div></div></div>';
+}
+function cycleVisual(s){
+ var c=S.cycles[s.id];if(!s.cycle||s.cycle.mode==='off')return '';
+ if(!c)return '<div class="cycle-visual small muted">周期流量计算中…</div>';
+ if(c.error)return '<div class="cycle-visual err small">'+esc(c.error)+'</div>';
+ var cur=c.cur,pct=Number(cur.pct),hasPct=cur.pct!=null&&Number.isFinite(pct),warn=hasPct&&pct>=s.cycle.alertPct;
+ return '<div class="cycle-visual"><div class="bar small"><span>本周期流量</span><span><b>'+fmtBytes(cur.used)+'</b>'+(cur.quota?' / '+fmtBytes(cur.quota):'')+'</span></div>'+
+ (hasPct?'<div class="meter" role="meter" aria-label="本周期配额使用率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+Math.max(0,Math.min(100,pct))+'" aria-valuetext="'+esc(pct+'%')+'"><i style="width:'+Math.max(0,Math.min(100,pct))+'%;background:var(--'+(warn?'bad':'accent')+')"></i></div>':'')+
+ '<div class="bar small muted"><span>'+day(cur.start)+' ~ '+day(cur.end-1)+'</span>'+(hasPct?'<b class="'+(warn?'err':'')+'">'+esc(pct)+'%</b>':'')+'</div></div>';
+}
 function cycleHtml(s){
  var c=S.cycles[s.id];if(!s.cycle||s.cycle.mode==='off')return '';
  if(!c)return '<span>周期</span><span class="muted">计算中…</span>';
@@ -1754,8 +1792,8 @@ function cardHtml(s){
  else{
   dot=d.active?'ok':'warn';
   var tr=d.traffic||{},ap=d.api||{};
-  body='<div class="chips">'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+
-  '<div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
+  body='<div class="chips"><span class="chip '+(d.active?'okc':'err')+'">'+(d.active?'运行中':'Sing-box 未运行')+'</span>'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+serverMetrics(d)+cycleVisual(s)+
+  '<details class="server-details" data-server-details="'+esc(s.id)+'"><summary data-server-details="'+esc(s.id)+'">系统与服务详情'+(needUpgrade(d)?' · 可升级':'')+'</summary><div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
   '<span>内核</span><span>sing-box '+esc(d.version||'-')+(d.active?'':' <b class="err">未运行</b>')+(needCore(d)?' <span class="chip">有新内核 '+esc(S.latest.core)+'</span>':'')+'</span>'+
   '<span>版本</span><span>脚本 '+esc(d.script_version||'-')+' · agent '+esc(d.agent)+(needUpgrade(d)?' <span class="chip err">可升级</span> <a data-act="upgrade" data-id="'+esc(s.id)+'">升级</a>':'')+'</span>'+
   '<span>IP</span><span>'+esc(d.server_ip||'-')+'</span>'+
@@ -1764,11 +1802,11 @@ function cardHtml(s){
   '<span>流量</span><span>'+(tr.enabled?'统计中 '+fmtBytes(tr.db_size):'<span class="muted">未开启</span>')+'</span>'+cycleHtml(s)+
   '<span>API权限</span><span>'+(ap.perms?ap.perms.map(function(p){return PERM_NAMES[p]||p}).join('、'):'-')+(ap.allow&&ap.allow.length?' · IP白名单':'')+'</span>'+
   '<span>重置</span><span>'+(d.last_reset?esc(d.last_reset.time)+' ('+esc((d.last_reset.items||[]).join(','))+')':'从未')+(d.schedule?' · 已设定时':'')+(d.leak&&d.leak.enabled?' · 泄露检测':'')+'</span>'+
-  (d.argo&&(d.argo.temp||d.argo.fixed)?'<span>Argo</span><span>'+esc(d.argo.fixed||d.argo.temp)+'</span>':'')+'</div>';
+  (d.argo&&(d.argo.temp||d.argo.fixed)?'<span>Argo</span><span>'+esc(d.argo.fixed||d.argo.temp)+'</span>':'')+'</div></details>';
  }
  var b=function(act,label,cls){return '<button data-act="'+act+'" data-id="'+esc(s.id)+'"'+(cls?' class="'+cls+'"':'')+'>'+label+'</button>'};
- return '<div class="card"><h3><input type="checkbox" data-sel="'+esc(s.id)+'"'+(S.selected[s.id]?' checked':'')+'><span class="dot '+dot+'"></span>'+esc(s.name)+(s.group?' <span class="chip">'+esc(s.group)+'</span>':'')+
- '<span class="muted small" style="margin-left:auto">'+esc(s.host)+':'+esc(s.port)+(st&&st.ms?' · '+st.ms+'ms':'')+'</span></h3>'+body+
+ return '<div class="card"><h3 class="server-head"><input type="checkbox" aria-label="选择 '+esc(s.name)+'" data-sel="'+esc(s.id)+'"'+(S.selected[s.id]?' checked':'')+'><span class="dot '+dot+'"></span>'+esc(s.name)+(s.group?' <span class="chip">'+esc(s.group)+'</span>':'')+
+ '<span class="muted small server-address" style="margin-left:auto">'+esc(s.host)+':'+esc(s.port)+(st&&st.ms?' · '+esc(st.ms)+'ms':'')+'</span></h3>'+body+
  '<div class="actions">'+b('logs','访问日志')+b('stats','IP统计')+b('traffic','流量')+b('peers','在线IP')+b('links','节点链接')+b('reset','重置参数','danger')+
  b('settings','日志/流量/定时')+b('apilog','API日志')+b('refresh','刷新')+b('restart','重启')+b('edit','编辑')+b('del','删除','danger')+'</div></div>';
 }
@@ -2298,13 +2336,27 @@ function deviceDialog(ip,q){
  }).catch(function(e){fail($('dv-out'),e)});
 }
 function chart(arr){
- var w=Math.max(600,arr.length*14),h=160,pad=30,max=arr.reduce(function(m,x){return Math.max(m,x.up+x.down)},0)||1,bw=(w-pad)/arr.length;
- var bars=arr.map(function(x,i){var bh=Math.round((x.up+x.down)/max*(h-30)),uh=Math.round(x.up/max*(h-30));var X=pad+i*bw;
-  return '<rect x="'+X.toFixed(1)+'" y="'+(h-20-bh)+'" width="'+Math.max(2,bw-2).toFixed(1)+'" height="'+bh+'" fill="var(--bar)"><title>'+esc(x.key)+' 合计 '+fmtBytes(x.up+x.down)+'</title></rect>'+
-  '<rect x="'+X.toFixed(1)+'" y="'+(h-20-uh)+'" width="'+Math.max(2,bw-2).toFixed(1)+'" height="'+uh+'" fill="var(--accent)" opacity=".8"><title>'+esc(x.key)+' 上行 '+fmtBytes(x.up)+'</title></rect>'+
-  ((i%Math.ceil(arr.length/10)===0)?'<text x="'+X.toFixed(1)+'" y="'+(h-6)+'">'+esc(String(x.key).slice(5))+'</text>':'')});
- return '<div class="card" style="margin-bottom:10px;overflow:auto"><div class="small muted">深色：上行　浅色：合计　最高 '+fmtBytes(max)+'</div><svg width="'+w+'" height="'+h+'" role="img" aria-label="流量柱状图">'+bars.join('')+'</svg></div>';
+ if(!arr.length)return '';
+ function bytes(v){v=Number(v);return Number.isFinite(v)&&v>0?v:0}
+ var rows=arr.map(function(x){return {key:String(x.key==null?'':x.key),up:bytes(x.up),down:bytes(x.down)}}),max=0,peak=0;
+ rows.forEach(function(x,i){if(x.up+x.down>max){max=x.up+x.down;peak=i}});
+ function detail(x){return x.key+' · ↑ '+fmtBytes(x.up)+' · ↓ '+fmtBytes(x.down)+' · 合计 '+fmtBytes(x.up+x.down)}
+ var bars=rows.map(function(x,i){var text=detail(x),scale=max||1,label=x.key.length>10?x.key.slice(11):x.key.length===10?x.key.slice(5):x.key;
+  return '<button class="chart-column" type="button" tabindex="'+(i===peak?'0':'-1')+'" data-chart-detail="'+esc(text)+'" aria-label="'+esc(text)+'" title="'+esc(text)+'"><span class="chart-stack" aria-hidden="true"><i class="chart-down" style="height:'+(x.down/scale*100)+'%"></i><i class="chart-up" style="height:'+(x.up/scale*100)+'%"></i></span><span class="chart-label" aria-hidden="true">'+(i%Math.ceil(rows.length/8)===0?esc(label):'')+'</span></button>';
+ });
+ return '<div class="card traffic-chart" role="group" aria-label="上下行流量图表"><div class="chart-legend"><span><i class="chart-up"></i>上行</span><span><i class="chart-down"></i>下行</span></div><div class="chart-readout" aria-live="polite">'+esc(detail(rows[peak]))+'</div><div class="chart-layout"><div class="chart-scale" aria-hidden="true"><span>'+fmtBytes(max)+'</span><span>'+fmtBytes(max/2)+'</span><span>0</span></div><div class="chart-scroll"><div class="chart-columns" style="min-width:'+Math.max(0,rows.length*24)+'px">'+bars.join('')+'</div></div></div></div>';
 }
+function chartInspect(e){
+ var bar=e.target.closest('[data-chart-detail]');if(!bar)return;
+ var root=bar.closest('.traffic-chart');root.querySelector('.chart-readout').textContent=bar.getAttribute('data-chart-detail');
+ if(e.type==='click'||e.type==='focusin'){root.querySelectorAll('[data-chart-detail]').forEach(function(b){b.tabIndex=b===bar?0:-1})}
+}
+document.addEventListener('pointerover',chartInspect);document.addEventListener('focusin',chartInspect);document.addEventListener('click',chartInspect);
+document.addEventListener('keydown',function(e){
+ var bar=e.target.closest('[data-chart-detail]');if(!bar)return;
+ var target;if(e.key==='ArrowRight')target=bar.nextElementSibling;else if(e.key==='ArrowLeft')target=bar.previousElementSibling;else if(e.key==='Home')target=bar.parentNode.firstElementChild;else if(e.key==='End')target=bar.parentNode.lastElementChild;else return;
+ e.preventDefault();if(target){target.focus({preventScroll:true});target.scrollIntoView({block:'nearest',inline:'nearest'})}
+});
 function exportCsv(){
  if(!TS.rows||!TS.rows.length)return toast('请先查询');
  var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0,q=function(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"'};
