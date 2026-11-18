@@ -14,9 +14,11 @@ new vm.Script(script);
 const elements = { summary: { innerHTML: '' } };
 const sandbox = {
   document: { getElementById: (id) => elements[id] || {}, addEventListener() {} },
+  requestAnimationFrame() {},
+  setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,updateSummary,csvCell,permissionText,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, updateSummary, csvCell, permissionText, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, S } = sandbox.renderers;
 
 assert.equal(csvCell(' @示例'), '"’ @示例"');
 assert.equal(csvCell('＝示例'), '"’＝示例"');
@@ -50,6 +52,28 @@ const cycle = cycleVisual({ id: 'test', cycle: { mode: 'month', alertPct: 80 } }
 assert.ok(cycle.includes('width:100%'));
 assert.ok(cycle.includes('120%'));
 assert.ok(cycle.includes('var(--bad)'));
+assert.ok(cycle.includes('本月流量'));
+assert.ok(cycle.includes('超额 20 B'));
+S.cycles.test = { tz: 8, cur: { start: Date.UTC(2026, 10, 9, 16), end: Date.UTC(2026, 11, 9, 16), used: 20, quota: 100, pct: 20, source: 'nic' }, prev: {} };
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'month', count: 'max', alertPct: 80, source: 'nic' } }).includes('2026-12-10 重置'));
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'days', count: 'max', alertPct: 80, source: 'nic' } }).includes('本周期流量'));
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'month', count: 'max', alertPct: 80, source: 'nic' } }).includes('剩余 80 B'));
+Object.assign(S.cycles.test.cur, { partial: true, since: '2026-11-11 08:00:00' });
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'month', source: 'nic' } }).includes('网卡从 2026-11-11 开始记录'));
+S.cycles.test.cur.partial = false;
+assert.ok(cycleVisual({ id: 'none', cycle: { mode: 'off' } }).includes('设置流量周期'));
+S.cycles.test.cur.available = false;
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'month' } }).includes('暂无可用数据'));
+assert.ok(!cycleVisual({ id: 'test', cycle: { mode: 'month' } }).includes('请开启流量统计'));
+assert.ok(cycleVisual({ id: 'test', cycle: { mode: 'month' } }, { traffic: { enabled: false } }).includes('请开启流量统计'));
+S.status.offline = { error: '连接超时' };
+assert.ok(cardHtml({ id: 'offline', name: '离线', host: '192.0.2.1', port: 1234, cycle: { mode: 'off' } }).includes('设置流量周期'));
+S.cycles.test.cur = { ...S.cycles.test.cur, available: true, used: 0, quota: 0, pct: null, source: 'proxy' };
+const noQuota = cycleVisual({ id: 'test', cycle: { mode: 'month', source: 'nic' } });
+assert.ok(noQuota.includes('未设配额') && noQuota.includes('网卡数据不可用，当前使用代理流量'));
+assert.ok(!noQuota.includes('剩余') && !noQuota.includes('超额'));
+assert.equal(cycleDate(Date.UTC(2026, 10, 30, 16), 8), '2026-12-01');
+assert.equal(cycleDate(Date.UTC(2026, 10, 1, 0), -8), '2026-10-31');
 S.servers = [{ id: 'a', group: 'one' }, { id: 'b', group: 'two' }, { id: 'c' }, { id: 'd' }];
 S.status = { a: { data: { active: true } }, b: { data: { active: false } }, c: { error: 'offline' } };
 updateSummary();
@@ -57,4 +81,23 @@ assert.ok(elements.summary.innerHTML.includes('运行中 1 台，服务停止 1 
 S.groupFilter = 'one';
 updateSummary();
 assert.ok(elements.summary.innerHTML.includes('运行中 1 台，服务停止 0 台，离线 0 台，待检测 0 台'));
-console.log('PASS 页面脚本语法、堆叠比例、零值/单点/2000 点、异常值/转义、内存缺失、超额配额和分组汇总');
+const pending = [];
+sandbox.fetch = (url) => new Promise((resolve) => pending.push({ url, resolve }));
+S.servers = [{ id: 'refresh', cycle: { mode: 'month' } }];
+const oldRefresh = refreshOne('refresh');
+const newRefresh = refreshOne('refresh');
+S.servers = S.servers.map((server) => ({ ...server, group: 'new-group' }));
+pending[1].resolve(Response.json({ ok: true, data: { active: true, hostname: 'new-status' } }));
+await new Promise(setImmediate);
+assert.equal(pending[2].url, '/api/servers/refresh/cycle');
+pending[2].resolve(Response.json({ ok: true, data: { cur: { used: 42 } } }));
+await newRefresh;
+pending[0].resolve(Response.json({ ok: true, data: { active: false, hostname: 'stale-status' } }));
+await oldRefresh;
+assert.equal(S.status.refresh.data.hostname, 'new-status');
+assert.equal(S.cycles.refresh.cur.used, 42);
+assert.equal(pending.length, 3);
+const ranges = rangeOf({ scope: 's:refresh', range: 'pcycle' });
+pending[3].resolve(Response.json({ ok: true, data: { prev: { start: 1000, end: 9000, queryEnd: 8000 } } }));
+assert.deepEqual(Array.from(await ranges), [1, 8]);
+console.log('PASS 页面脚本语法、图表、CSV 与转义、内存、周期配额/时区/缺失数据和分组汇总');

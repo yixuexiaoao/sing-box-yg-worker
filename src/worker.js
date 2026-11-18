@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.5.10';
+const VERSION = '1.6.0';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -814,8 +814,12 @@ function validCycle(c) {
   if (mode === 'month') out.day = Math.round(num(c.day || 1, 1, 31, '每月重置日'));
   else {
     out.len = Math.round(num(c.len || 30, 1, 366, '周期天数'));
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(c.start || ''))) throw httpError(400, '周期起始日期格式应为 YYYY-MM-DD');
-    out.start = c.start;
+    const start = String(c.start || '');
+    const date = new Date(start + 'T00:00:00Z');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== start) {
+      throw httpError(400, '请选择有效的周期起始日期（YYYY-MM-DD）');
+    }
+    out.start = start;
   }
   return out;
 }
@@ -834,33 +838,40 @@ export function cyclePeriods(cycle, nowMs, tz) {
     if (at(y, mo) > nowMs) mo -= 1;
     return { cur: [at(y, mo), at(y, mo + 1)], prev: [at(y, mo - 1), at(y, mo)] };
   }
-  const [Y, M, D] = cycle.start.split('-').map(Number);
-  const s0 = Date.UTC(Y, M - 1, D) - off;
+  const s0 = Date.parse(cycle.start + 'T00:00:00Z') - off;
   const L = cycle.len * 86400000;
   const start = s0 + Math.floor((nowMs - s0) / L) * L;
   return { cur: [start, start + L], prev: [start - L, start] };
 }
 
 function cycleUsage(d, cycle) {
-  const useNic = cycle.source !== 'proxy' && d.nic && d.nic.since;
+  const useNic = cycle.source !== 'proxy' && d.nic && d.nic.since && (!d.range || d.nic.since < d.range[1]);
   const up = useNic ? d.nic.tx : d.total.up;
   const down = useNic ? d.nic.rx : d.total.down;
   const used = cycle.count === 'up' ? up : cycle.count === 'down' ? down : cycle.count === 'max' ? Math.max(up, down) : up + down;
-  return { up, down, used, source: useNic ? 'nic' : 'proxy', since: (d.nic && d.nic.since) || '' };
+  const since = (d.nic && d.nic.since) || '';
+  const partial = !!(useNic && d.range?.[0] && since > d.range[0]);
+  return { up, down, used, source: useNic ? 'nic' : 'proxy', since, partial };
 }
 
 async function serverCycle(srv, settings, now) {
   const c = srv.cycle;
   if (!c || c.mode === 'off') return null;
   const p = cyclePeriods(c, now, settings.tz);
-  const q = (r) => callAgent(srv, 'traffic', { start: Math.floor(r[0] / 1000), end: Math.floor(Math.min(r[1], now) / 1000), group: 'day', limit: 400 }, 30000);
-  const [cur, prev] = await Promise.all([q(p.cur), q(p.prev)]);
   const quota = c.quotaGB * GB;
-  const pack = (d, r) => {
-    const u = cycleUsage(d, c);
-    return { ...u, start: r[0], end: r[1], quota, pct: quota ? Math.round((u.used / quota) * 1000) / 10 : null };
+  const pack = async ([start, end], closed) => {
+    // sbagent 按小时存储流量。横跨重置点的一小时计入新周期，避免两个周期重复累计。
+    const queryEnd = closed ? Math.floor(end / 3600000) * 3600000 : Math.floor(now / 1000) * 1000;
+    const queryStart = Math.floor(start / 3600000) * 3600;
+    const d = queryEnd / 1000 > queryStart
+      ? await callAgent(srv, 'traffic', { start: queryStart, end: queryEnd / 1000, group: 'day', limit: 400 }, 30000)
+      : null;
+    const available = !!d && (!Array.isArray(d.range) || d.range.length > 0);
+    const u = available ? cycleUsage(d, c) : { up: 0, down: 0, used: 0, source: c.source, since: '' };
+    return { range: { ...u, start, end, queryEnd, available, quota, pct: quota && available ? Math.round((u.used / quota) * 1000) / 10 : null }, days: d?.rows || [] };
   };
-  return { cycle: c, cur: pack(cur, p.cur), prev: pack(prev, p.prev), days: cur.rows };
+  const [cur, prev] = await Promise.all([pack(p.cur, false), pack(p.prev, true)]);
+  return { cycle: c, tz: settings.tz, cur: cur.range, prev: prev.range, days: cur.days };
 }
 
 function validServer(s) {
@@ -907,6 +918,7 @@ async function importData(env, data) {
   for (const raw of arr) {
     if (!raw || typeof raw !== 'object') continue;
     const v = validServer(raw);
+    if (raw.cycle !== undefined) v.cycle = validCycle(raw.cycle);
     const token = String(raw.token || '').trim();
     if (token.length < 16) continue;
     const i = list.findIndex((s) => s.host === v.host && s.port === v.port);
@@ -1313,11 +1325,11 @@ async function cycleCheck(env, settings, servers, now) {
     const fmtq = (x) => fmtBytes(x.used) + (x.quota ? ' / ' + fmtBytes(x.quota) + '（' + x.pct + '%）' : '');
     // 上一周期结算：每个周期只发送一次
     const pk = 'cs:' + s.id + ':' + d.prev.start;
-    if (!(await env.SBYG_KV.get(pk))) {
+    if (d.prev.available && !(await env.SBYG_KV.get(pk))) {
       await env.SBYG_KV.put(pk, '1', { expirationTtl: 400 * 86400 });
       await tgEvent(settings, 'cycle', '🧾 ' + s.name + ' 上一流量周期结算\n' + span(d.prev) + '：' + fmtq(d.prev) + '\n（↑' + fmtBytes(d.prev.up) + ' ↓' + fmtBytes(d.prev.down) + '，' + (d.prev.source === 'nic' ? '网卡流量' : '代理流量') + '）');
     }
-    if (d.cur.quota && d.cur.pct >= s.cycle.alertPct) {
+    if (d.cur.available && d.cur.quota && d.cur.pct >= s.cycle.alertPct) {
       const ak = 'qa:' + s.id + ':' + d.cur.start + ':' + (d.cur.pct >= 100 ? 100 : s.cycle.alertPct);
       if (!(await env.SBYG_KV.get(ak))) {
         await env.SBYG_KV.put(ak, '1', { expirationTtl: 400 * 86400 });
@@ -1629,6 +1641,7 @@ a{color:var(--accent);cursor:pointer;text-decoration:none}
 .toast{position:fixed;right:16px;bottom:16px;background:var(--fg);color:var(--bg);padding:8px 12px;border-radius:6px;z-index:20;max-width:80vw}
 label{display:inline-flex;gap:4px;align-items:center}
 .field{display:flex;flex-direction:column;gap:3px;margin-bottom:8px}
+.field[data-cm][hidden]{display:none}
 .row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
 .stat{display:inline-block;margin-right:16px}
 .stat b{font-size:18px}
@@ -1646,6 +1659,7 @@ svg text{fill:var(--muted);font-size:10px}
 .metric-values{display:flex;flex:1;flex-wrap:wrap;gap:8px 18px}.metric-values b{display:block;font-size:16px}.metric-values small{color:var(--muted);font-size:11px}
 .server-details{margin-top:8px}.server-details>summary{cursor:pointer;font-size:12px;color:var(--muted)}
 .cycle-visual{padding:8px 0;border-top:1px solid var(--line)}.cycle-visual .bar{justify-content:space-between}.cycle-visual .meter{height:8px;margin:6px 0}.cycle-visual .meter i{height:8px}
+.cycle-amount{font-size:22px;line-height:1.3}.cycle-meta{display:flex;flex-wrap:wrap;gap:5px 12px;margin-top:6px}.cycle-tools{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.cycle-tools button{padding:3px 8px;font-size:12px}.server-note{margin:6px 0;font-size:12px;color:var(--muted);overflow-wrap:anywhere}.collection-state{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}.collection-state .chip{font-size:11px}
 .traffic-chart{margin-bottom:10px;min-width:0}.chart-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;font-size:12px}.chart-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}.chart-up{background:var(--accent)}.chart-down{background:var(--bar)}
 .chart-readout{min-height:26px;margin:8px 0 4px;font-size:12px;overflow-wrap:anywhere}.chart-layout{display:flex;gap:8px}.chart-scale{width:54px;flex:none;display:flex;flex-direction:column;justify-content:space-between;padding-bottom:24px;font-size:10px;color:var(--muted)}
 .chart-scroll{overflow-x:auto;flex:1;min-width:0}.chart-columns{display:flex;height:180px;min-width:100%;border-bottom:1px solid var(--line);background:linear-gradient(to top,transparent calc(50% - 1px),var(--line) 50%,transparent calc(50% + 1px))}
@@ -1795,38 +1809,45 @@ function updateSummary(){
 }
 var PERM_NAMES={read:'只读',links:'节点链接',manage:'管理',upgrade:'远程升级'};
 function permissionText(perms){return Array.isArray(perms)?esc(perms.map(function(p){return Object.hasOwn(PERM_NAMES,p)?PERM_NAMES[p]:p}).join('、')):'-'}
-function day(t){return fmtTime(t).slice(0,10)}
+function cycleDate(t,tz){
+ var off=Number(tz);if(!Number.isFinite(off))off=Number(S.me&&S.me.settings&&S.me.settings.tz)||0;
+ var date=new Date(Number(t)+off*3600000);return Number.isFinite(date.getTime())?date.toISOString().slice(0,10):'—';
+}
+function cycleTools(s,details){return '<div class="cycle-tools">'+(details?'<button data-act="cycletraffic" data-id="'+esc(s.id)+'">查看明细</button>':'')+'<button data-act="cycleedit" data-id="'+esc(s.id)+'">设置流量周期</button></div>'}
 function serverMetrics(d){
  var mem=d.mem||{},total=Number(mem.MemTotal),available=Number(mem.MemAvailable),hasMem=Number.isFinite(total)&&total>0&&mem.MemAvailable!=null&&Number.isFinite(available);
  var used=hasMem?Math.max(0,Math.min(total,total-available)):0,pct=hasMem?Math.round(used/total*100):null;
  return '<div class="server-metrics"><div class="memory-dial" style="--usage:'+(pct||0)+'%" role="img" aria-label="'+esc(hasMem?'内存使用 '+pct+'%，'+fmtBytes(used)+' / '+fmtBytes(total):'内存数据不可用')+'"><span>'+(hasMem?pct+'%':'—')+'<small>内存</small></span></div><div class="metric-values"><div><b>'+esc(fmtUp(d.uptime))+'</b><small>运行时间</small></div><div><b>'+esc(d.load&&d.load[0]!=null?d.load[0]:'—')+'</b><small>1 分钟负载</small></div></div></div>';
 }
-function cycleVisual(s){
- var c=S.cycles[s.id];if(!s.cycle||s.cycle.mode==='off')return '';
- if(!c)return '<div class="cycle-visual small muted">周期流量计算中…</div>';
- if(c.error)return '<div class="cycle-visual err small">'+esc(c.error)+'</div>';
- var cur=c.cur,pct=Number(cur.pct),hasPct=cur.pct!=null&&Number.isFinite(pct),warn=hasPct&&pct>=s.cycle.alertPct;
- return '<div class="cycle-visual"><div class="bar small"><span>本周期流量</span><span><b>'+fmtBytes(cur.used)+'</b>'+(cur.quota?' / '+fmtBytes(cur.quota):'')+'</span></div>'+
+function cycleVisual(s,status){
+ var c=S.cycles[s.id];if(!s.cycle||s.cycle.mode==='off')return '<div class="cycle-visual small muted">尚未设置流量周期'+cycleTools(s,false)+'</div>';
+ var title=s.cycle.mode==='month'?'本月流量':'本周期流量';
+ if(!c)return '<div class="cycle-visual small muted">'+title+'计算中…'+cycleTools(s,false)+'</div>';
+ if(c.error)return '<div class="cycle-visual"><div class="err small">'+esc(c.error)+'</div>'+cycleTools(s,false)+'</div>';
+ var cur=c.cur;if(!cur||cur.available===false)return '<div class="cycle-visual"><div class="small muted">'+title+'暂无可用数据'+(status&&status.traffic&&status.traffic.enabled===false?'，请开启流量统计':'')+'</div>'+cycleTools(s,false)+'</div>';
+ var pct=Number(cur.pct),hasPct=cur.pct!=null&&Number.isFinite(pct),warn=hasPct&&pct>=s.cycle.alertPct,quota=Number(cur.quota)||0,used=Number(cur.used)||0;
+ var count={both:'上行 + 下行',up:'仅上行',down:'仅下行',max:'上下行较大值'}[s.cycle.count]||'上行 + 下行',fallback=s.cycle.source!=='proxy'&&cur.source==='proxy';
+ return '<div class="cycle-visual"><div class="bar small"><b>'+title+'</b>'+(hasPct?'<b class="'+(warn?'err':'')+'">'+esc(pct)+'%</b>':'<span class="muted">未设配额</span>')+'</div><div><b class="cycle-amount">'+fmtBytes(used)+'</b>'+(quota?' <span class="small muted">/ '+fmtBytes(quota)+'</span>':'')+'</div>'+
  (hasPct?'<div class="meter" role="meter" aria-label="本周期配额使用率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+Math.max(0,Math.min(100,pct))+'" aria-valuetext="'+esc(pct+'%')+'"><i style="width:'+Math.max(0,Math.min(100,pct))+'%;background:var(--'+(warn?'bad':'accent')+')"></i></div>':'')+
- '<div class="bar small muted"><span>'+day(cur.start)+' ~ '+day(cur.end-1)+'</span>'+(hasPct?'<b class="'+(warn?'err':'')+'">'+esc(pct)+'%</b>':'')+'</div></div>';
+ '<div class="bar small"><span class="'+(used>quota&&quota?'err':'muted')+'">'+(quota?(used>quota?'超额 '+fmtBytes(used-quota):'剩余 '+fmtBytes(quota-used)):'按实际用量统计')+'</span><span class="muted">'+cycleDate(cur.end,c.tz)+' 重置</span></div><div class="cycle-meta small muted"><span>'+cycleDate(cur.start,c.tz)+' ~ '+cycleDate(cur.end-1,c.tz)+'</span><span>'+(cur.source==='nic'?'网卡':'代理')+' · '+count+'</span></div>'+
+ (fallback?'<div class="small err">网卡数据不可用，当前使用代理流量</div>':'')+
+ (cur.partial?'<div class="small err">网卡从 '+esc(String(cur.since).slice(0,10))+' 开始记录，账期用量可能不完整</div>':'')+cycleTools(s,true)+'</div>';
 }
 function cycleHtml(s){
  var c=S.cycles[s.id];if(!s.cycle||s.cycle.mode==='off')return '';
  if(!c)return '<span>周期</span><span class="muted">计算中…</span>';
  if(c.error)return '<span>周期</span><span class="err">'+esc(c.error)+'</span>';
- var cur=c.cur,pct=cur.pct==null?null:Math.min(100,cur.pct);
- return '<span>本周期</span><span>'+day(cur.start)+' ~ '+day(cur.end-1)+'：<b>'+fmtBytes(cur.used)+'</b>'+(cur.quota?' / '+fmtBytes(cur.quota)+' <b class="'+(cur.pct>=s.cycle.alertPct?'err':'')+'">'+cur.pct+'%</b>':'')+
-  (pct!=null?'<div class="meter" style="margin-top:2px"><i style="width:'+Math.max(1,pct)+'%;'+(cur.pct>=s.cycle.alertPct?'background:var(--bad)':'')+'"></i></div>':'')+'</span>'+
-  '<span>上周期</span><span>'+day(c.prev.start)+' ~ '+day(c.prev.end-1)+'：'+fmtBytes(c.prev.used)+(c.prev.quota?'（'+c.prev.pct+'%）':'')+' <span class="muted">'+(cur.source==='nic'?'网卡流量':'代理流量')+(cur.since?'，网卡数据自 '+esc(cur.since.slice(0,10)):'')+'</span></span>';
+ var prev=c.prev;if(!prev)return '';
+ return '<span>上周期</span><span>'+cycleDate(prev.start,c.tz)+' ~ '+cycleDate(prev.end-1,c.tz)+' · '+(prev.available===false?'暂无可用数据':fmtBytes(prev.used)+(prev.quota?' / '+fmtBytes(prev.quota):''))+'</span>';
 }
 function cardHtml(s){
  var st=S.status[s.id],d=st&&st.data,dot='',body='';
- if(!st){body='<div class="muted small">加载中…</div>'}
- else if(st.error){dot='bad';body='<div class="err small">'+esc(st.error)+'</div>'}
+ if(!st){body='<div class="muted small">加载中…</div>'+cycleTools(s,false)}
+ else if(st.error){dot='bad';body='<div class="err small">'+esc(st.error)+'</div>'+cycleTools(s,false)}
  else{
   dot=d.active?'ok':'warn';
   var tr=d.traffic||{},ap=d.api||{};
-  body='<div class="chips"><span class="chip '+(d.active?'okc':'err')+'">'+(d.active?'运行中':'Sing-box 未运行')+'</span>'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+serverMetrics(d)+cycleVisual(s)+
+  body='<div class="chips"><span class="chip '+(d.active?'okc':'err')+'">'+(d.active?'运行中':'Sing-box 未运行')+'</span><span class="chip">内核 '+esc(d.version||'未知')+'</span>'+(d.inbounds||[]).map(function(i){return '<span class="chip">'+esc(i.name)+' :'+esc(i.port)+'</span>'}).join('')+'</div>'+serverMetrics(d)+'<div class="collection-state"><span class="chip '+(d.log&&d.log.enabled?'okc':'')+'">日志 '+(d.log&&d.log.enabled?'开启':'关闭')+'</span><span class="chip '+(tr.enabled?'okc':'')+'">流量统计 '+(tr.enabled?'开启':'关闭')+'</span>'+(d.schedule?'<span class="chip">定时重置</span>':'')+(d.leak&&d.leak.enabled?'<span class="chip">泄露检测</span>':'')+'</div>'+cycleVisual(s,d)+
   '<details class="server-details" data-server-details="'+esc(s.id)+'"><summary data-server-details="'+esc(s.id)+'">系统与服务详情'+(needUpgrade(d)?' · 可升级':'')+'</summary><div class="kv"><span>系统</span><span>'+esc(d.os||'-')+' / '+esc(d.hostname)+'</span>'+
   '<span>内核</span><span>sing-box '+esc(d.version||'-')+(d.active?'':' <b class="err">未运行</b>')+(needCore(d)?' <span class="chip">有新内核 '+esc(S.latest.core)+'</span>':'')+'</span>'+
   '<span>版本</span><span>脚本 '+esc(d.script_version||'-')+' · agent '+esc(d.agent)+(needUpgrade(d)?' <span class="chip err">可升级</span> <a data-act="upgrade" data-id="'+esc(s.id)+'">升级</a>':'')+'</span>'+
@@ -1840,19 +1861,24 @@ function cardHtml(s){
  }
  var b=function(act,label,cls){return '<button data-act="'+act+'" data-id="'+esc(s.id)+'"'+(cls?' class="'+cls+'"':'')+'>'+label+'</button>'};
  return '<div class="card"><h3 class="server-head"><input type="checkbox" aria-label="选择 '+esc(s.name)+'" data-sel="'+esc(s.id)+'"'+(S.selected[s.id]?' checked':'')+'><span class="dot '+dot+'"></span>'+esc(s.name)+(s.group?' <span class="chip">'+esc(s.group)+'</span>':'')+
- '<span class="muted small server-address" style="margin-left:auto">'+esc(s.host)+':'+esc(s.port)+(st&&st.ms?' · '+esc(st.ms)+'ms':'')+'</span></h3>'+body+
+ '<span class="muted small server-address" style="margin-left:auto">'+esc(s.host)+':'+esc(s.port)+(st&&st.ms?' · '+esc(st.ms)+'ms':'')+'</span></h3>'+(s.note?'<p class="server-note">'+esc(s.note)+'</p>':'')+body+
  '<div class="actions">'+b('logs','访问日志')+b('stats','IP统计')+b('traffic','流量')+b('peers','在线IP')+b('links','节点链接')+b('reset','重置参数','danger')+
  b('settings','日志/流量/定时')+b('apilog','API日志')+b('refresh','刷新')+b('restart','重启')+b('edit','编辑')+b('del','删除','danger')+'</div></div>';
 }
-function refreshOne(id){var t0=Date.now(),s=srvById(id);
- return call(id,'status').then(function(d){S.status[id]={data:d,ms:Date.now()-t0};
-  if(s&&s.cycle&&s.cycle.mode!=='off'){delete S.cycles[id];api('/api/servers/'+id+'/cycle',{body:{}}).then(function(j){S.cycles[id]=j.data},function(e){S.cycles[id]={error:e.message}}).then(scheduleRender)}
- },function(e){S.status[id]={error:e.message}}).then(scheduleRender)}
+var serverRefreshSeq={};
+function refreshOne(id){var t0=Date.now(),s=srvById(id),seq=(serverRefreshSeq[id]||0)+1;serverRefreshSeq[id]=seq;
+ function current(){var latest=srvById(id);return serverRefreshSeq[id]===seq&&latest&&JSON.stringify([latest.host,latest.port,latest.path,latest.cycle])===JSON.stringify([s.host,s.port,s.path,s.cycle])}
+ delete S.cycles[id];
+ return call(id,'status').then(function(d){if(!current())return;S.status[id]={data:d,ms:Date.now()-t0};scheduleRender();
+  if(s&&s.cycle&&s.cycle.mode!=='off')return api('/api/servers/'+id+'/cycle',{body:{}}).then(function(j){if(current())S.cycles[id]=j.data},function(e){if(current())S.cycles[id]={error:e.message}});
+ },function(e){if(current())S.status[id]={error:e.message}}).then(scheduleRender)}
 function refreshAll(){S.status={};renderGrid();return Promise.all(visibleServers().map(function(s){return refreshOne(s.id)}))}
 function onAction(act,id){
  var s=srvById(id);
  if(act==='refresh')return refreshOne(id);
  if(act==='edit')return editServer(s);
+ if(act==='cycleedit')return editServer(s,true);
+ if(act==='cycletraffic'){S.trafficPreset={scope:'s:'+id,range:'cycle',group:'day',sort:'bytes',limit:200,split:false};return go('traffic')}
  if(act==='del'){if(confirm('删除服务器「'+s.name+'」？(仅从面板移除，不影响VPS)'))api('/api/servers/'+id,{method:'DELETE'}).then(loadServers).catch(function(e){toast(e.message)});return}
  if(act==='restart'){if(confirm('重启「'+s.name+'」的 Sing-box？'))call(id,'restart').then(function(d){toast(d.active?'重启成功':'重启后未运行，请检查');refreshOne(id)}).catch(function(e){toast(e.message)});return}
  if(act==='traffic'){S.trafficScope='s:'+id;return go('traffic')}
@@ -1860,7 +1886,7 @@ function onAction(act,id){
  if(act==='upgrade')return upgradeDialog([id]);
  var f={logs:logsDialog,stats:statsDialog,peers:peersDialog,links:linksDialog,settings:settingsDialog,apilog:apilogDialog}[act];if(f)f(s);
 }
-function editServer(s){
+function editServer(s,focusCycle){
  s=s||{cycle:{mode:'off'}};var c=s.cycle||{mode:'off'};
  modal(s.id?'编辑服务器':'添加服务器',
  (s.id?'':'<div class="field"><span class="small muted">粘贴VPS上 sb → 19 → 2 输出的对接JSON，自动填写</span><textarea id="f-json" rows="3"></textarea></div>')+
@@ -1872,11 +1898,11 @@ function editServer(s){
  '<div class="field"><span class="small muted">Token'+(s.id?' (留空表示不修改)':'')+'</span><input id="f-token" type="password" autocomplete="off"></div>'+
  '<div class="field"><span class="small muted">备注</span><input id="f-note" value="'+esc(s.note||'')+'"></div>'+
  '<div class="section card"><h3>流量周期与配额</h3><div class="row"><div class="field"><span class="small muted">周期</span><select id="f-cm"><option value="off">不启用</option><option value="month">每月固定日重置</option><option value="days">固定天数为一个周期</option></select></div>'+
- '<div class="field" data-cm="month"><span class="small muted">每月重置日（1-31，月份没有该日时取月末）</span><input id="f-cday" type="number" value="'+esc(c.day||1)+'"></div>'+
+ '<div class="field" data-cm="month"><span class="small muted">每月重置日（1-31，月份没有该日时取月末）</span><input id="f-cday" type="number" min="1" max="31" step="1" value="'+esc(c.day||1)+'"></div>'+
  '<div class="field" data-cm="days"><span class="small muted">周期起始日期</span><input id="f-cstart" type="date" value="'+esc(c.start||fmtTime(Date.now()).slice(0,8)+'01')+'"></div>'+
- '<div class="field" data-cm="days"><span class="small muted">每个周期天数</span><input id="f-clen" type="number" value="'+esc(c.len||30)+'"></div>'+
- '<div class="field" data-cm="on"><span class="small muted">流量配额 GB（0 不限）</span><input id="f-cq" type="number" value="'+esc(c.quotaGB||0)+'"></div>'+
- '<div class="field" data-cm="on"><span class="small muted">达到配额百分之几时告警</span><input id="f-ca" type="number" value="'+esc(c.alertPct||90)+'"></div>'+
+ '<div class="field" data-cm="days"><span class="small muted">每个周期天数</span><input id="f-clen" type="number" min="1" max="366" step="1" value="'+esc(c.len||30)+'"></div>'+
+ '<div class="field" data-cm="on"><span class="small muted">流量配额 GB（0 不限）</span><input id="f-cq" type="number" min="0" max="1000000" step="any" value="'+esc(c.quotaGB||0)+'"></div>'+
+ '<div class="field" data-cm="on"><span class="small muted">达到配额百分之几时告警</span><input id="f-ca" type="number" min="1" max="100" step="1" value="'+esc(c.alertPct||90)+'"></div>'+
  '<div class="field" data-cm="on"><span class="small muted">计算方式</span><select id="f-cc"><option value="both">上行+下行</option><option value="up">仅上行(出站)</option><option value="down">仅下行(入站)</option><option value="max">取上下行较大值</option></select></div>'+
  '<div class="field" data-cm="on"><span class="small muted">数据来源</span><select id="f-cs"><option value="nic">网卡总流量（与运营商计费接近）</option><option value="proxy">代理流量（sing-box）</option></select></div></div>'+
  '<p class="small muted" data-cm="days">例：起始 2026-11-01、周期 30 天 → 11-01~11-30 为一个周期，12-01 重新计算。时间按「设置」中的时区。</p></div>'+
@@ -1884,6 +1910,7 @@ function editServer(s){
  $('f-cm').value=c.mode||'off';$('f-cc').value=c.count||'both';$('f-cs').value=c.source||'nic';
  function cm(){var m=val('f-cm');document.querySelectorAll('[data-cm]').forEach(function(el){var k=el.getAttribute('data-cm');el.hidden=!(k===m||(k==='on'&&m!=='off'))})}
  $('f-cm').addEventListener('change',cm);cm();
+ if(focusCycle){$('f-cm').focus();$('f-cm').scrollIntoView({block:'center'})}
  var js=$('f-json');
  if(js)js.addEventListener('input',function(){try{var o=JSON.parse(js.value);['name','host','port','path','token'].forEach(function(k){if(o[k]!=null)$('f-'+k).value=o[k]})}catch(e){}});
  $('f-save').addEventListener('click',function(){
@@ -2193,11 +2220,13 @@ function viewTraffic(){
  '<p class="small muted" style="margin:6px 0 0">点击表格中的项目逐级下钻，用路径或「返回上一级」回退；多台服务器时默认按服务器分别列出，可明确看到同一IP经过哪台服务器访问了哪些地址。IP归属地来自公开IP库，缓存30天。</p></div>'+
  '<div class="bar" id="t-crumb" style="margin-bottom:8px"></div><div id="t-sum" style="margin-bottom:10px"></div><div id="t-srvsum"></div><div id="t-chart"></div><div class="tablewrap" id="t-out"></div>';
  $('t-range').addEventListener('change',function(){$('t-custom').hidden=val('t-range')!=='custom'});
- $('t-go').addEventListener('click',function(){TS.stack=[{label:'查询',q:readControls()}];runTraffic()});
- $('t-reset').addEventListener('click',function(){S.lastTrafficQ=null;viewTraffic()});
+ $('t-go').addEventListener('click',function(){TS.preservePreference=false;TS.stack=[{label:'查询',q:readControls()}];runTraffic()});
+ $('t-reset').addEventListener('click',function(){S.lastTrafficQ=null;TS.preservePreference=false;viewTraffic()});
  $('t-csv').addEventListener('click',exportCsv);
  ['t-ip','t-host','t-loc','t-min'].forEach(function(id){$(id).addEventListener('keydown',function(e){if(e.key==='Enter')$('t-go').click()})});
  var q=S.lastTrafficQ?JSON.parse(JSON.stringify(S.lastTrafficQ)):{scope:'',range:'24h',group:'ip',sort:'bytes',limit:200,split:true};
+ TS.preservePreference=!!S.trafficPreset;
+ if(S.trafficPreset){q=S.trafficPreset;S.trafficPreset=null}
  if(S.trafficScope){q.scope=S.trafficScope;S.trafficScope=null}
  TS.stack=[{label:'查询',q:q}];
  runTraffic();
@@ -2215,7 +2244,7 @@ function rangeOf(q){
  if(r){if(!r[0]||!r[1]||r[0]>=r[1])return Promise.reject(new Error('请选择有效的时间范围'));return Promise.resolve(r)}
  var list=scopeServers(q.scope);
  if(list.length!==1||!list[0].cycle||list[0].cycle.mode==='off')return Promise.reject(new Error('「流量周期」需选择单台已设置周期的服务器（在服务器「编辑」中设置）'));
- return api('/api/servers/'+list[0].id+'/cycle',{body:{}}).then(function(j){var p=q.range==='cycle'?j.data.cur:j.data.prev;return [Math.floor(p.start/1000),Math.floor(Math.min(p.end,Date.now())/1000)]});
+ return api('/api/servers/'+list[0].id+'/cycle',{body:{}}).then(function(j){var p=q.range==='cycle'?j.data.cur:j.data.prev;return [Math.floor(p.start/1000),Math.floor(Math.min(p.queryEnd==null?p.end:p.queryEnd,Date.now())/1000)]});
 }
 // agent 1.2.0 起支持精确筛选与新维度；旧版会忽略这些参数并返回全部数据，必须识别出来，避免把别人的流量算到所选IP上
 var OLD_AGENT='该服务器 sbagent 版本过旧，不支持此查询，请在VPS上运行 sb 选择 7 更新脚本';
@@ -2228,7 +2257,7 @@ function agentParams(q,range,group,limit){
 }
 function runTraffic(){
  var top=TS.stack[TS.stack.length-1],q=top.q;
- S.lastTrafficQ=TS.stack[0].q;
+ if(!TS.preservePreference)S.lastTrafficQ=TS.stack[0].q;
  writeControls(q);
  $('t-crumb').innerHTML=(TS.stack.length>1?'<button id="t-back">← 返回上一级</button>':'')+TS.stack.map(function(x,i){return i===TS.stack.length-1?'<b>'+esc(x.label)+'</b>':'<a data-ci="'+i+'">'+esc(x.label)+'</a> ›'}).join(' ');
  if($('t-back'))$('t-back').addEventListener('click',function(){TS.stack.pop();runTraffic()});

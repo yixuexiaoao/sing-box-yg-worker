@@ -277,10 +277,23 @@ try {
   check(pr.cur[0] === T('2026-12-01T00:00:00') && pr.prev[0] === T('2026-11-01T00:00:00') && pr.prev[1] === T('2026-12-01T00:00:00'), '30-day cycle: 11-01~11-30, then restarts 12-01');
   r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', cycle: { mode: 'days', len: 30, start: 'bad' } });
   check(r.status === 400, 'invalid cycle rejected');
+  r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', cycle: { mode: 'days', len: 30, start: '2026-02-30' } });
+  check(r.status === 400, 'impossible billing date rejected');
   r = await post('/api/servers', { id, name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', cycle: { mode: 'month', day: 1, quotaGB: 1000, alertPct: 80, count: 'max', source: 'nic' } });
   check(r.status === 200 && r.body.data[0].cycle.count === 'max', 'cycle saved');
   r = await post('/api/servers/' + id + '/cycle', {});
   check(r.status === 200 && r.body.data.cur.quota === 1000 * 1073741824 && typeof r.body.data.prev.used === 'number' && r.body.data.cur.start < Date.now(), 'cycle usage computed via agent');
+  check(typeof r.body.data.cur.available === 'boolean' && (!r.body.data.cur.available ? r.body.data.cur.pct === null : r.body.data.cur.pct >= 0), 'cycle response distinguishes unavailable data from zero usage');
+  await post('/api/settings', { tz: 5.5 });
+  r = await post('/api/servers/' + id + '/cycle', {});
+  check(r.status === 200 && r.body.data.tz === 5.5 && r.body.data.cur.start === r.body.data.prev.end &&
+    r.body.data.prev.queryEnd === Math.floor(r.body.data.cur.start / 3600000) * 3600000 &&
+    r.body.data.prev.end - r.body.data.prev.queryEnd === 1800000, 'adjacent billing cycles do not overlap an hourly bucket');
+  await post('/api/settings', { tz: 8 });
+  const backedUpCycle = { mode: 'days', start: '2026-11-01', len: 30, quotaGB: 50, count: 'up', source: 'proxy' };
+  r = await post('/api/import', { servers: [{ name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', token, cycle: backedUpCycle }] });
+  const restoredCycle = (await req('GET', '/api/servers')).body.data.find((s) => s.id === id).cycle;
+  check(r.status === 200 && restoredCycle.mode === 'days' && restoredCycle.start === backedUpCycle.start && restoredCycle.quotaGB === 50 && restoredCycle.count === 'up', 'billing settings restored from backup');
 
   // ---------- IP 归属地
   r = await post('/api/geo', { ips: ['192.0.2.77', 'not-an-ip', '<script>'] });
