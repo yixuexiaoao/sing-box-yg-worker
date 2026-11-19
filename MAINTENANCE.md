@@ -22,7 +22,7 @@
 | 需要核对的版本 | 来源和验证入口 |
 |---|---|
 | Worker 面板自身 | GitHub `package.json`、`src/worker.js` 的 `VERSION`，以及生产面板页眉和 `/api/me`。GitHub 最新提交须与 Cloudflare 当前 Active Deployment 对照。 |
-| VPS 脚本、agent | `UPSTREAM` 指向 VPS 正式仓库。`fetchLatest` 读取 `version` 和 `sbagent.py` 的开头，服务器 `status` 提供已装 `script_version` 与 `agent`。 |
+| VPS 脚本、agent | `UPSTREAM` 指向 VPS 正式仓库。`fetchLatest` 完整读取 `version` 和 `sbagent.py`，服务器 `status` 提供已装 `script_version` 与 `agent`。 |
 | sing-box 内核 | 面板从 SagerNet 发布数据读取目标版本，已装版本由 VPS 状态接口提供。内核版本不参与脚本更新记录筛选。 |
 
 1. 如果截图里的「GitHub 最新」比仓库版本旧，先看生产面板页眉，再点「检查更新 → 重新检查」。普通查询的版本缓存有效期是 30 分钟，手动重新检查绕开 KV 和子请求缓存。若仍有问题，对照已登录面板的 `/api/latest?refresh=1` 和 GitHub `main`。

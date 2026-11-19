@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
+import { gzipSync } from 'node:zlib';
 import { loadWorker, memoryKV, fakeCtx } from './harness.mjs';
 
 const [agentPy, sbDir] = process.argv.slice(2);
@@ -49,7 +50,17 @@ globalThis.fetch = async (u, opt) => {
   if (String(u).startsWith('https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main/')) {
     ghCalls++;
     const f = String(u).split('/').pop();
-    if (f === 'sbagent.py') ghRange = (opt && opt.headers && opt.headers.range) || '';
+    if (f === 'sbagent.py') {
+      const headers = new Headers(opt?.headers);
+      ghRange = headers.get('range');
+      ghEncoding = headers.get('accept-encoding');
+      if (ghRange || ghReadFailure) {
+        const compressed = gzipSync('import os\nVERSION = "9.9.9"\n');
+        const truncated = new Blob([compressed.subarray(0, -8)]).stream();
+        return new Response(truncated.pipeThrough(new DecompressionStream('gzip')), { status: ghRange ? 206 : 200 });
+      }
+      if (ghPartial) return new Response('VERSION = "9.9.9"\n', { status: 206 });
+    }
     ghCacheMode = opt?.cache;
     if (ghUnavailable) return new Response('', { status: 503 });
     if (ghBadVersion) return new Response('unknown version');
@@ -65,7 +76,8 @@ globalThis.fetch = async (u, opt) => {
   }
   return realFetch(u, opt);
 };
-let whoisCalls = 0, ghCalls = 0, ghRange = '', ghCacheMode, ghUnavailable = false, ghBadVersion = false;
+let whoisCalls = 0, ghCalls = 0, ghRange, ghEncoding, ghCacheMode;
+let ghUnavailable = false, ghBadVersion = false, ghReadFailure = false, ghPartial = false;
 const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
 fs.copyFileSync(agentPy, agentCopy);
 const upFiles = {};
@@ -404,7 +416,7 @@ try {
   check(r.status === 200 && r.body.data.script === 'v99.1' && r.body.data.agent === '9.9.9' && r.body.data.notes[0] === '1、新功能A' && r.body.data.notes.length === 2, 'latest versions parsed from GitHub');
   check(r.body.data.releases.length === 2 && r.body.data.releases[1].version === 'v26.1' && r.body.data.releases[1].notes[0] === 'old', 'latest response includes all script release blocks');
   check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
-  check(ghRange === 'bytes=0-8191', 'only the head of sbagent.py is fetched for its version');
+  check(ghRange === null && ghEncoding === 'identity', 'sbagent version is read from a full uncompressed response');
   check(ghCacheMode === 'no-store', 'GitHub version fetch bypasses the subrequest cache');
   const gh = ghCalls;
   await req('GET', '/api/latest');
@@ -439,6 +451,14 @@ try {
     r = await req('GET', '/api/latest?refresh=1');
     check(r.status === 502 && JSON.parse(await env.SBYG_KV.get('latest')).script === old.script, 'invalid upstream version does not overwrite cache');
     ghBadVersion = false;
+    ghPartial = true;
+    r = await req('GET', '/api/latest?refresh=1');
+    check(r.status === 502 && r.body.error.includes('sbagent.py') && r.body.error.includes('206'), 'unexpected partial version file is rejected');
+    ghPartial = false;
+    ghReadFailure = true;
+    r = await req('GET', '/api/latest?refresh=1');
+    check(r.status === 502 && r.body.error.includes('sbagent.py') && JSON.parse(await env.SBYG_KV.get('latest')).script === old.script, 'truncated response identifies the failing file and preserves cache');
+    ghReadFailure = false;
   }
   r = await call('status');
   check(r.status === 200 && 'script_version' in r.body.data, 'status reports script version');

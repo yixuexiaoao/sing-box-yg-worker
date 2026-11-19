@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.2';
+const VERSION = '1.6.3';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -974,13 +974,19 @@ export function parseScriptReleases(text) {
 }
 
 async function fetchLatest(env) {
-  const get = async (f, upto) => {
-    const r = await fetch(UPSTREAM + '/' + f, { cache: 'no-store', headers: { 'user-agent': 'sbyg-worker/' + VERSION, ...(upto ? { range: 'bytes=0-' + upto } : {}) } });
-    if (!r.ok) throw httpError(502, '获取 GitHub 版本失败：HTTP ' + r.status);
-    return r.text();
+  const get = async (f) => {
+    const r = await fetch(UPSTREAM + '/' + f, {
+      cache: 'no-store', headers: { 'user-agent': 'sbyg-worker/' + VERSION, 'accept-encoding': 'identity' },
+    });
+    if (r.status !== 200) throw httpError(502, '获取 GitHub 版本文件 ' + f + ' 失败：HTTP ' + r.status);
+    try {
+      return await r.text();
+    } catch (e) {
+      throw httpError(502, '读取 GitHub 版本文件 ' + f + ' 失败：' + e.message);
+    }
   };
-  // sbagent.py 约 100KB，而版本号在文件开头：只取前 8KB（服务器不支持 Range 时返回整个文件，结果相同）
-  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py', 8191), coreVersions().catch(() => ({}))]);
+  // GitHub 可能对 gzip 表示返回范围响应，部分压缩流无法完整解码。
+  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py'), coreVersions().catch(() => ({}))]);
   const releases = parseScriptReleases(ver);
   const script = releases[0]?.version || '';
   const notes = releases[0]?.notes.filter((x) => x.trim()) || [];
