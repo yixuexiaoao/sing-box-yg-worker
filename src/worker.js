@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.3';
+const VERSION = '1.6.4';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -974,9 +974,10 @@ export function parseScriptReleases(text) {
 }
 
 async function fetchLatest(env) {
+  const deadline = AbortSignal.timeout(10000);
   const get = async (f) => {
     const r = await fetch(UPSTREAM + '/' + f, {
-      cache: 'no-store', headers: { 'user-agent': 'sbyg-worker/' + VERSION, 'accept-encoding': 'identity' },
+      cache: 'no-store', signal: deadline, headers: { 'user-agent': 'sbyg-worker/' + VERSION, 'accept-encoding': 'identity' },
     });
     if (r.status !== 200) throw httpError(502, '获取 GitHub 版本文件 ' + f + ' 失败：HTTP ' + r.status);
     try {
@@ -986,7 +987,7 @@ async function fetchLatest(env) {
     }
   };
   // GitHub 可能对 gzip 表示返回范围响应，部分压缩流无法完整解码。
-  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py'), coreVersions().catch(() => ({}))]);
+  const [ver, agent, core] = await Promise.all([get('version'), get('sbagent.py'), coreVersions(deadline).catch(() => ({}))]);
   const releases = parseScriptReleases(ver);
   const script = releases[0]?.version || '';
   const notes = releases[0]?.notes.filter((x) => x.trim()) || [];
@@ -1009,14 +1010,14 @@ function cmpKey(a, b) {
   for (let i = 0; i < Math.max(a.length, b.length); i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) - (b[i] || 0);
   return 0;
 }
-async function coreVersions() {
+async function coreVersions(signal) {
   let vers = [];
   try {
-    const r = await fetch('https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box');
+    const r = await fetch('https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box', { signal });
     if (r.ok) vers = (await r.json()).versions || [];
   } catch (_) { /* 改用 GitHub API */ }
   if (!vers.length) {
-    const r = await fetch('https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30', { headers: { 'user-agent': 'sbyg-worker/' + VERSION } });
+    const r = await fetch('https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30', { signal, headers: { 'user-agent': 'sbyg-worker/' + VERSION } });
     if (r.ok) vers = (await r.json()).map((x) => String(x.tag_name || '').replace(/^v/, ''));
   }
   vers = [...new Set(vers.filter((v) => CORE_RE.test(v)))].sort((a, b) => cmpKey(coreKey(b), coreKey(a)));
@@ -1406,7 +1407,7 @@ export function deriveKeys(token) {
     if (KEY_CACHE.size >= 256) KEY_CACHE.delete(KEY_CACHE.keys().next().value);
     p = deriveKeysRaw(token);
     KEY_CACHE.set(token, p);
-    p.catch(() => KEY_CACHE.delete(token));
+    p.catch(() => { if (KEY_CACHE.get(token) === p) KEY_CACHE.delete(token); });
   }
   return p;
 }
@@ -1429,8 +1430,20 @@ function macInput(iv, ct, z) {
   return out;
 }
 
-async function streamBytes(data, stream) {
-  const res = new Response(new Blob([data]).stream().pipeThrough(stream));
+const AGENT_RESPONSE_LIMIT = 16 * 1024 * 1024;
+const AGENT_HEADER_LIMIT = 16 * 1024;
+
+async function streamBytes(data, stream, limit) {
+  let output = new Blob([data]).stream().pipeThrough(stream);
+  if (limit !== undefined) {
+    let size = 0;
+    output = output.pipeThrough(new TransformStream({ transform(chunk, controller) {
+      size += chunk.byteLength;
+      if (size > limit) throw httpError(502, '解压后的服务器响应过大');
+      controller.enqueue(chunk);
+    } }));
+  }
+  const res = new Response(output);
   return new Uint8Array(await res.arrayBuffer());
 }
 
@@ -1451,7 +1464,8 @@ export async function unseal(env, keys) {
     throw new Error('响应签名校验失败');
   }
   let pt = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, keys.enc, ct));
-  if (z) pt = await streamBytes(pt, new DecompressionStream('deflate'));
+  if (z) pt = await streamBytes(pt, new DecompressionStream('deflate'), AGENT_RESPONSE_LIMIT);
+  if (pt.byteLength > AGENT_RESPONSE_LIMIT) throw httpError(502, '解密后的服务器响应过大');
   return JSON.parse(dec.decode(pt));
 }
 
@@ -1464,54 +1478,46 @@ export async function callAgent(srv, action, params, timeoutMs = 60000, openSock
   const resp = await httpPost(srv.host, srv.port, srv.path || '/api', body, timeoutMs, openSocket);
   if (resp.status === 404) throw httpError(502, '服务器拒绝请求(404)：请检查Token、API路径、IP白名单，以及VPS系统时间是否准确');
   if (resp.status !== 200) throw httpError(502, '服务器返回 HTTP ' + resp.status);
-  const out = await unseal(JSON.parse(dec.decode(resp.body)), keys);
-  if (out.rn !== nonce) throw httpError(502, '响应与请求不匹配');
+  let out;
+  try {
+    out = await unseal(JSON.parse(dec.decode(resp.body)), keys);
+  } catch (e) {
+    if (e.status) throw e;
+    throw httpError(502, '服务器响应无法解析：' + e.message);
+  }
+  if (!out || out.rn !== nonce) throw httpError(502, '响应与请求不匹配');
   if (!out.ok) throw httpError(502, out.error || '服务器执行失败');
   return out.data;
 }
 
 async function httpPost(host, port, path, body, timeoutMs, openSocket) {
   const hostname = String(host).replace(/^\[|\]$/g, '');
-  let timer;
-  const socket = openSocket({ hostname, port: Number(port) });
-  const work = (async () => {
-    const w = socket.writable.getWriter();
-    const hostHdr = (hostname.includes(':') ? '[' + hostname + ']' : hostname) + ':' + port;
-    await w.write(enc.encode(`POST ${path} HTTP/1.1\r\nHost: ${hostHdr}\r\nUser-Agent: sbyg-worker/${VERSION}\r\n` +
-      `Content-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`));
-    await w.write(body);
-    w.releaseLock();
-    const r = socket.readable.getReader();
-    const chunks = [];
-    let total = 0, need = -1, headLen = -1;
-    for (;;) {
-      const { value, done } = await r.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.length;
-      if (total > 64 * 1024 * 1024) throw new Error('响应过大');
-      if (headLen < 0) {
-        const buf = concat(chunks, total);
-        const i = indexOfCRLF2(buf);
-        if (i >= 0) {
-          headLen = i + 4;
-          const cl = dec.decode(buf.subarray(0, i)).match(/\r\ncontent-length:\s*(\d+)/i);
-          if (cl) need = headLen + parseInt(cl[1], 10);
-        }
-      }
-      if (need >= 0 && total >= need) break;
-    }
-    const buf = concat(chunks, total);
-    const i = indexOfCRLF2(buf);
-    if (i < 0) throw new Error('服务器无响应或响应不完整');
-    const status = parseInt(dec.decode(buf.subarray(0, i)).split(' ')[1], 10);
-    return { status, body: buf.subarray(i + 4, need >= 0 ? need : buf.length) };
-  })();
-  const timeout = new Promise((_, rej) => {
-    timer = setTimeout(() => rej(httpError(504, '连接服务器超时：请检查IP/端口与VPS防火墙')), timeoutMs);
-  });
-  work.catch(() => {});
+  let timer, socket, reader, writer;
   try {
+    socket = openSocket({ hostname, port: Number(port) });
+    socket.opened?.catch(() => {});
+    socket.closed?.catch(() => {});
+    const work = (async () => {
+      writer = socket.writable.getWriter();
+      try {
+        const hostHdr = (hostname.includes(':') ? '[' + hostname + ']' : hostname) + ':' + port;
+        await writer.write(enc.encode(`POST ${path} HTTP/1.1\r\nHost: ${hostHdr}\r\nUser-Agent: sbyg-worker/${VERSION}\r\n` +
+          `Content-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`));
+        await writer.write(body);
+      } finally {
+        writer?.releaseLock();
+        writer = null;
+      }
+      reader = socket.readable.getReader();
+      try { return await readAgentResponse(reader); }
+      finally {
+        reader?.releaseLock();
+        reader = null;
+      }
+    })();
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(httpError(504, '连接服务器超时：请检查IP/端口与VPS防火墙')), timeoutMs);
+    });
     return await Promise.race([work, timeout]);
   } catch (e) {
     if (e.status) throw e;
@@ -1523,8 +1529,47 @@ async function httpPost(host, port, path, body, timeoutMs, openSocket) {
     throw httpError(502, '连接服务器失败：' + msg);
   } finally {
     clearTimeout(timer);
-    Promise.resolve().then(() => socket.close()).catch(() => { /* 已关闭 */ });
+    // 即使底层 I/O 尚未返回，也先解锁，再关闭双向连接。
+    reader?.releaseLock();
+    writer?.releaseLock();
+    reader = writer = null;
+    if (socket) Promise.resolve().then(() => socket.close()).catch(() => { /* 已关闭 */ });
   }
+}
+
+async function readAgentResponse(reader) {
+  const chunks = [];
+  let total = 0, need = -1, headLen = -1, status = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > AGENT_HEADER_LIMIT + AGENT_RESPONSE_LIMIT) throw new Error('响应过大');
+    chunks.push(value);
+    if (headLen < 0) {
+      const buf = concat(chunks, total);
+      const end = indexOfCRLF2(buf.subarray(0, AGENT_HEADER_LIMIT));
+      if (end < 0) {
+        if (total >= AGENT_HEADER_LIMIT) throw new Error('响应头过大');
+        continue;
+      }
+      headLen = end + 4;
+      const head = dec.decode(buf.subarray(0, end));
+      status = Number(head.match(/^HTTP\/1\.[01] ([1-5]\d\d)(?:[ \t]|\r\n|$)/)?.[1]);
+      if (!status) throw new Error('无效的 HTTP 响应头');
+      const lengths = [...head.matchAll(/^content-length:[ \t]*(.*)$/gim)];
+      if (lengths.length) {
+        if (lengths.length !== 1 || !/^\d+$/.test(lengths[0][1].trim())) throw new Error('无效的响应长度');
+        const n = Number(lengths[0][1]);
+        if (!Number.isSafeInteger(n) || n > AGENT_RESPONSE_LIMIT) throw new Error('响应过大');
+        need = headLen + n;
+      }
+    }
+    if (total - headLen > AGENT_RESPONSE_LIMIT) throw new Error('响应过大');
+    if (need >= 0 && total >= need) break;
+  }
+  if (headLen < 0 || (need >= 0 && total < need)) throw new Error('服务器无响应或响应不完整');
+  return { status, body: concat(chunks, total).subarray(headLen, need >= 0 ? need : total) };
 }
 
 function concat(chunks, total) {
@@ -2466,7 +2511,7 @@ function exportCsv(){
  var ipCol=['ip','ip_host','ip_inbound'].indexOf(TS.group)>=0;
  var lines=['server,key,'+(ipCol?'location,isp,':'')+'upload,download,total,conns,ips,hosts'].concat(TS.rows.map(function(x){var ip=ipCol?ipOf(x.key,TS.group):null,g=ip?GEO[ip]:null;
   return [x.srv?x.srv.name:x.servers.join('/'),x.key].concat(ipCol?[geoText(g),geoIsp(g)]:[]).concat([x.up,x.down,x.up+x.down,x.conns,x.ips,x.hosts]).map(csvCell).join(',')}));
- var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\\ufeff'+lines.join('\\n')],{type:'text/csv'}));a.download='traffic-'+TS.group+'.csv';a.click();
+ var a=document.createElement('a'),url=URL.createObjectURL(new Blob(['\\ufeff'+lines.join('\\n')],{type:'text/csv'}));a.href=url;a.download='traffic-'+TS.group+'.csv';a.click();setTimeout(function(){URL.revokeObjectURL(url)},5000);
 }
 
 // ================= 订阅管理

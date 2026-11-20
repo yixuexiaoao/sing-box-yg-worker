@@ -10,6 +10,7 @@
 | `package.json` | 项目版本及本地开发、测试、部署命令。面板版本须与 `src/worker.js` 的 `VERSION` 一致。 |
 | `wrangler.toml` | Worker 入口、兼容日期、`SBYG_KV` 绑定和 Cron 参数。发布前核对实际使用的 Cloudflare 环境和绑定。 |
 | `test/charts.mjs` | 从 Worker 实际生成的页面脚本验证图表、更新提示和版本说明等前端行为。 |
+| `test/transport.mjs` | 验证套接字关闭和解锁，以及超时、不完整响应、响应大小和解压上限。 |
 | `test/e2e.mjs` | Worker 端到端测试。使用内存 KV，启动真实 sbagent 的临时副本验证协议、版本查询、权限、统计和升级。 |
 | `test/harness.mjs`、`test/dev-server.mjs` | Node 中模拟 Cloudflare 套接字和 KV，以及本地预览服务。 |
 | `README.md`、`CHANGELOG.md`、`SECURITY.md` | 分别说明用户功能及部署、发版变更及验证、安全边界。 |

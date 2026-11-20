@@ -17,8 +17,8 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,TS,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, TS, S } = sandbox.renderers;
 
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);
@@ -149,4 +149,17 @@ assert.equal(pending.length, 3);
 const ranges = rangeOf({ scope: 's:refresh', range: 'pcycle' });
 pending[3].resolve(Response.json({ ok: true, data: { prev: { start: 1000, end: 9000, queryEnd: 8000 } } }));
 assert.deepEqual(Array.from(await ranges), [1, 8]);
+let csvUrlReleased, finishDownload, clicked = false;
+const link = { click() { clicked = true; } };
+sandbox.document.createElement = () => link;
+sandbox.Blob = Blob;
+sandbox.URL = { createObjectURL: () => 'blob:traffic', revokeObjectURL: (url) => { csvUrlReleased = url; } };
+sandbox.setTimeout = (fn) => { finishDownload = fn; };
+TS.group = 'day';
+TS.rows = [{ servers: ['test'], key: '2026-11-20', up: 1, down: 2, conns: 1, ips: 1, hosts: 1 }];
+exportCsv();
+assert.ok(clicked && link.download === 'traffic-day.csv');
+assert.equal(csvUrlReleased, undefined);
+finishDownload();
+assert.equal(csvUrlReleased, 'blob:traffic');
 console.log('PASS 页面脚本语法、图表、CSV 与转义、内存、周期配额/时区/缺失数据和分组汇总');

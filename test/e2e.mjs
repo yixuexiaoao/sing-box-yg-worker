@@ -62,6 +62,7 @@ globalThis.fetch = async (u, opt) => {
       if (ghPartial) return new Response('VERSION = "9.9.9"\n', { status: 206 });
     }
     ghCacheMode = opt?.cache;
+    ghSignal = opt?.signal;
     if (ghUnavailable) return new Response('', { status: 503 });
     if (ghBadVersion) return new Response('unknown version');
     return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
@@ -76,7 +77,7 @@ globalThis.fetch = async (u, opt) => {
   }
   return realFetch(u, opt);
 };
-let whoisCalls = 0, ghCalls = 0, ghRange, ghEncoding, ghCacheMode;
+let whoisCalls = 0, ghCalls = 0, ghRange, ghEncoding, ghCacheMode, ghSignal;
 let ghUnavailable = false, ghBadVersion = false, ghReadFailure = false, ghPartial = false;
 const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
 fs.copyFileSync(agentPy, agentCopy);
@@ -418,6 +419,7 @@ try {
   check(r.body.data.core === '1.14.4' && r.body.data.corePre === '1.15.0-alpha.10', 'latest sing-box core versions (semver sorted, invalid tags ignored)');
   check(ghRange === null && ghEncoding === 'identity', 'sbagent version is read from a full uncompressed response');
   check(ghCacheMode === 'no-store', 'GitHub version fetch bypasses the subrequest cache');
+  check(ghSignal instanceof AbortSignal, 'GitHub version fetch has a request deadline');
   const gh = ghCalls;
   await req('GET', '/api/latest');
   check(ghCalls === gh, 'latest versions cached');
