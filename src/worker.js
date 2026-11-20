@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.4';
+const VERSION = '1.6.5';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -97,8 +97,7 @@ async function route(request, env, ctx) {
     return json({ ok: true });
   }
   if (p === '/api/logout-all' && m === 'POST') {
-    const v = parseInt((await env.SBYG_KV.get('sessver')) || '0', 10) + 1;
-    await env.SBYG_KV.put('sessver', String(v));
+    await authState(env, { op: 'logout-all' });
     note('panel', '退出所有设备', { ok: true });
     return json({ ok: true }, 200, { 'set-cookie': COOKIE + '=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' });
   }
@@ -113,7 +112,7 @@ async function route(request, env, ctx) {
   }
   if (p === '/api/export' && m === 'POST') {
     const body = await readJson(request);
-    if (!(await guardedCheck(env, who, () => passwordOk(env, body && body.password)))) {
+    if (!(await guardedCheck(env, who, { password: body && body.password }))) {
       note('panel', '导出配置', { ok: false, msg: '密码错误' });
       throw httpError(403, '密码错误');
     }
@@ -323,6 +322,7 @@ async function getSettings(env) {
   try { out.tg.token = await decSecret(env, out.tg.token); } catch (e) { out._tgEnc = out.tg.token; out.tg.token = ''; out._secretErr = e.message; }
   out.tg.events = { ...DEFAULT_SETTINGS.tg.events, ...((s.tg && s.tg.events) || {}) };
   out.monitor = { ...DEFAULT_SETTINGS.monitor, ...(s.monitor || {}) };
+  out.totp = (await authState(env, { op: 'status' })).totp;
   return out;
 }
 
@@ -430,11 +430,12 @@ async function listAudit(env, q) {
   const kw = (q.get('q') || '').toLowerCase();
   const from = Number(q.get('from')) || 0;
   const to = Number(q.get('to')) || Infinity;
-  const limit = Math.min(500, Number(q.get('limit')) || 100);
+  const limit = Math.max(1, Math.min(500, Math.floor(Number(q.get('limit')) || 100)));
   let cursor = q.get('cursor') || undefined;
   const items = [];
   for (let page = 0; page < 10 && items.length < limit; page++) {
-    const r = await env.SBYG_KV.list({ prefix: 'a:', cursor, limit: 1000 });
+    // KV 游标指向整批数据之后，每批最多读取当前页的剩余条数。
+    const r = await env.SBYG_KV.list({ prefix: 'a:', cursor, limit: limit - items.length });
     for (const k of r.keys) {
       const e = k.metadata;
       if (!e || e.t > to) continue;
@@ -488,13 +489,147 @@ function failKeyOf(ip) {
 }
 
 // 所有校验密码/二次验证码的入口共用同一个失败计数：持有有效会话的人也不能无限次猜测
-async function guardedCheck(env, who, fn) {
-  const key = failKeyOf(who.ip);
-  const fails = parseInt((await env.SBYG_KV.get(key)) || '0', 10);
-  if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '失败次数过多，请15分钟后再试');
-  const ok = await fn();
-  if (!ok) await env.SBYG_KV.put(key, String(fails + 1), { expirationTtl: 900 });
-  return ok;
+async function guardedCheck(env, who, check) {
+  return (await authState(env, { op: 'verify', key: failKeyOf(who.ip), passwordCheck: !check.totp, ...check })).ok;
+}
+
+async function authState(env, body) {
+  if (!env.AUTH_STATE) throw httpError(503, '缺少 AUTH_STATE 安全状态绑定，请使用仓库 wrangler.toml 重新部署');
+  const stub = env.AUTH_STATE.get(env.AUTH_STATE.idFromName('admin'));
+  const response = await stub.fetch('https://auth.internal/', { method: 'POST', body: JSON.stringify(body) });
+  if (!response.ok) throw httpError(503, '安全状态服务不可用');
+  const result = await response.json();
+  if (result.status) throw httpError(result.status, result.error);
+  return result;
+}
+
+// 单例权威安全状态，KV 仅用于首次迁移。
+export class AuthState {
+  constructor(state, env) { this.state = state; this.env = env; }
+
+  async fetch(request) {
+    try {
+      const body = await request.json();
+      return await this.state.blockConcurrencyWhile(async () => {
+        let existing = await this.state.storage.get('auth');
+        if (!existing) {
+          const rawSettings = await this.env.SBYG_KV.get('settings');
+          let settings;
+          try {
+            settings = rawSettings === null ? {} : JSON.parse(rawSettings);
+            if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error();
+          } catch (_) {
+            return json({ status: 503, error: '旧安全配置损坏，请恢复 KV settings 后重新访问' });
+          }
+          const secret = (await this.env.SBYG_KV.get('totp_secret')) || '';
+          if (settings.totp && !secret) {
+            return json({ status: 503, error: '旧配置已开启二次验证但密钥缺失，请恢复 KV totp_secret 后重新访问' });
+          }
+          await this.state.storage.put('auth', {
+            totp: !!settings.totp || !!secret, secret,
+            pending: '', pendingUntil: 0, used: Number(await this.env.SBYG_KV.get('totp_used')) || 0,
+            version: (await this.env.SBYG_KV.get('sessver')) || '0',
+            legacyUntil: Date.now() + 900000,
+          });
+          existing = await this.state.storage.get('auth');
+        }
+        let legacyFails = 0;
+        if (body.key && Date.now() < existing.legacyUntil && !(await this.state.storage.get(body.key))) {
+          legacyFails = Number(await this.env.SBYG_KV.get(body.key)) || 0;
+        }
+        try {
+          const result = await this.state.storage.transaction(async (tx) => {
+            const auth = await tx.get('auth');
+            const out = await this.perform(tx, auth, body, legacyFails);
+            if (!['status', 'problem'].includes(body.op)) await tx.put('auth', auth);
+            return out;
+          });
+          return json(result);
+        } catch (e) {
+          return json({ status: e.status || 503, error: e.status ? e.message : '安全状态服务不可用' });
+        }
+      });
+    } catch (e) {
+      return json({ status: e.status || 503, error: e.status ? e.message : '安全状态服务不可用' });
+    }
+  }
+
+  async perform(tx, auth, body, legacyFails) {
+    const now = Date.now();
+    if (body.op === 'status') return { totp: auth.totp, version: auth.version };
+    if (body.op === 'logout-all') {
+      auth.version = String(BigInt(auth.version) + 1n);
+      return { ok: true };
+    }
+    if (body.op === 'migrate') {
+      auth.secret = await encSecret(this.env, auth.secret);
+      auth.pending = await encSecret(this.env, auth.pending);
+      return { ok: true };
+    }
+    if (body.op === 'problem') {
+      if (auth.totp && !auth.secret) return { error: '旧配置已开启二次验证但密钥缺失，请恢复原 TOTP 密钥后重新迁移安全状态' };
+      try {
+        await decSecret(this.env, auth.secret);
+        return { error: '' };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+    if (body.op === 'setup') {
+      if (auth.totp) throw httpError(409, '二次验证已开启，请先验证身份并关闭现有配置');
+      const secret = b32encode(crypto.getRandomValues(new Uint8Array(20)));
+      auth.pending = await encSecret(this.env, secret);
+      auth.pendingUntil = now + 600000;
+      return { secret };
+    }
+    if (!['login', 'verify', 'enable', 'disable'].includes(body.op)) throw httpError(400, '不支持的安全操作');
+    if (body.op === 'enable' && auth.totp) throw httpError(409, '二次验证已开启');
+    if (!body.key || !body.key.startsWith('fail:')) throw httpError(400, '缺少验证来源');
+    const stored = await tx.get(body.key);
+    const failures = stored ? (stored.until > now ? stored.count : 0) : legacyFails;
+    if (failures >= LOGIN_MAX_FAIL) throw httpError(429, '失败次数过多，请15分钟后再试');
+    const passwordNeeded = ['login', 'enable', 'disable'].includes(body.op) || !!body.passwordCheck;
+    const passwordGood = !passwordNeeded || await passwordOk(this.env, body.password);
+    let ok = passwordGood;
+    if (ok && body.op === 'login' && auth.totp && !body.code) return { ok: false, needTotp: true };
+    const totpNeeded = body.op === 'enable' || body.op === 'disable' || !!body.totp || (body.op === 'login' && auth.totp);
+    if (ok && totpNeeded) {
+      const pending = body.op === 'enable';
+      const raw = pending ? (auth.pendingUntil > now ? auth.pending : '') : (auth.totp ? auth.secret : '');
+      const secret = raw ? await decSecret(this.env, raw) : '';
+      const counter = secret ? await totpCounter(secret, String(body.code || '')) : null;
+      ok = counter !== null && (pending || counter > auth.used);
+      if (ok) auth.used = counter;
+    }
+    if (!stored || !ok) {
+      await tx.put(body.key, { count: failures + (ok ? 0 : 1), until: now + 900000 });
+      if (!(await this.state.storage.getAlarm())) await this.state.storage.setAlarm(now + 900000);
+    }
+    if (!ok) return { ok: false, error: passwordGood ? '二次验证码错误或已使用' : '密码错误' };
+    if (body.op === 'enable') {
+      auth.secret = auth.pending;
+      auth.pending = '';
+      auth.pendingUntil = 0;
+      auth.totp = true;
+    }
+    if (body.op === 'disable') {
+      auth.secret = '';
+      auth.pending = '';
+      auth.pendingUntil = 0;
+      auth.used = 0;
+      auth.totp = false;
+    }
+    return { ok: true, version: auth.version };
+  }
+
+  async alarm() {
+    await this.state.blockConcurrencyWhile(async () => {
+      const entries = await this.state.storage.list({ prefix: 'fail:', limit: 128 });
+      const expired = [...entries].filter(([, value]) => value.until <= Date.now()).map(([key]) => key);
+      if (expired.length) await this.state.storage.delete(expired);
+      if (entries.size === 128 || entries.size > expired.length) await this.state.storage.setAlarm(Date.now() + (expired.length ? 1000 : 900000));
+    });
+  }
 }
 
 async function passwordOk(env, password) {
@@ -511,22 +646,11 @@ async function login(request, env, ctx, who, settings) {
     note(false, 'IP不在登录白名单');
     throw httpError(403, '当前IP不允许登录');
   }
-  const failKey = failKeyOf(who.ip);
-  const fails = parseInt((await env.SBYG_KV.get(failKey)) || '0', 10);
-  if (fails >= LOGIN_MAX_FAIL) throw httpError(429, '登录失败次数过多，请15分钟后再试');
   const body = (await readJson(request, 16 * 1024)) || {};
-  const bad = async (msg) => {
-    await env.SBYG_KV.put(failKey, String(fails + 1), { expirationTtl: 900 });
-    note(false, msg);
-    return httpError(401, msg);
-  };
-  if (!(await passwordOk(env, body.password))) throw await bad('密码错误');
-  if (settings.totp) {
-    if (!body.code) return json({ ok: false, needTotp: true, error: '请输入二次验证码' }, 401);
-    const secret = await getSecret(env, 'totp_secret');
-    if (!secret || !(await totpVerify(secret, String(body.code), env))) throw await bad('二次验证码错误或已使用');
-  }
-  const ver = (await env.SBYG_KV.get('sessver')) || '0';
+  const result = await authState(env, { op: 'login', key: failKeyOf(who.ip), password: body.password, code: body.code });
+  if (result.needTotp) return json({ ok: false, needTotp: true, error: '请输入二次验证码' }, 401);
+  if (!result.ok) { note(false, result.error); throw httpError(401, result.error); }
+  const ver = result.version;
   const ttl = settings.sessionHours * 3600;
   const exp = Math.floor(Date.now() / 1000) + ttl;
   const sig = b64url(await crypto.subtle.sign('HMAC', await sessionKey(env), enc.encode('sess:' + exp + ':' + ver)));
@@ -537,7 +661,7 @@ async function login(request, env, ctx, who, settings) {
 async function checkSession(request, env) {
   const m = (request.headers.get('cookie') || '').match(new RegExp('(?:^|;\\s*)' + COOKIE + '=(\\d+)\\.(\\d+)\\.([A-Za-z0-9_-]{43})(?=\\s*(?:;|$))'));
   if (!m || parseInt(m[1], 10) < Date.now() / 1000) return false;
-  if (m[2] !== ((await env.SBYG_KV.get('sessver')) || '0')) return false;
+  if (m[2] !== (await authState(env, { op: 'status' })).version) return false;
   let sig;
   try {
     sig = b64urlDecode(m[3]);
@@ -558,8 +682,7 @@ function timingSafeEqual(a, b) {
 async function requireTotp(env, settings, code, what, note, who) {
   // 审计日志等敏感数据的删除：必须已开启二次验证且本次提供正确验证码
   if (!settings.totp) throw httpError(403, what + '需要二次验证，请先在「设置 → 安全」中开启二次验证');
-  const secret = await getSecret(env, 'totp_secret');
-  const good = !!secret && (who ? await guardedCheck(env, who, () => totpVerify(secret, String(code || ''), env)) : await totpVerify(secret, String(code || ''), env));
+  const good = await guardedCheck(env, who, { totp: true, code: String(code || '') });
   if (!good) {
     if (note) note('panel', what, { ok: false, msg: '二次验证码错误' });
     throw httpError(403, '二次验证码错误');
@@ -567,36 +690,21 @@ async function requireTotp(env, settings, code, what, note, who) {
 }
 
 async function totpRoute(op, request, env, settings, note, who) {
-  if (settings.totp && (op === 'setup' || op === 'enable')) throw httpError(409, '二次验证已开启，请先验证身份并关闭现有配置');
   const body = (await readJson(request)) || {};
   if (op === 'setup') {
-    const secret = b32encode(crypto.getRandomValues(new Uint8Array(20)));
-    await env.SBYG_KV.put('totp_pending', await encSecret(env, secret), { expirationTtl: 600 });
+    const { secret } = await authState(env, { op: 'setup' });
     const label = encodeURIComponent(settings.title);
     return json({ ok: true, secret, uri: 'otpauth://totp/' + label + ':admin?secret=' + secret + '&issuer=' + label });
   }
-  if (op === 'enable') {
-    const secret = await getSecret(env, 'totp_pending');
-    if (!secret) throw httpError(400, '请先生成密钥（10分钟内有效）');
-    if (!(await guardedCheck(env, who, async () => (await passwordOk(env, body.password)) && (await totpVerify(secret, String(body.code || ''), env))))) {
-      note('panel', '开启二次验证', { ok: false, msg: '密码或验证码错误' });
+  if (op === 'enable' || op === 'disable') {
+    const result = await authState(env, { op, key: failKeyOf(who.ip), password: body.password, code: String(body.code || '') });
+    const act = op === 'enable' ? '开启二次验证' : '关闭二次验证';
+    if (!result.ok) {
+      note('panel', act, { ok: false, msg: '密码或验证码错误' });
       throw httpError(403, '密码或验证码错误');
     }
-    await env.SBYG_KV.put('totp_secret', await encSecret(env, secret));
-    await env.SBYG_KV.delete('totp_pending');
-    await putSettings(env, { ...settings, totp: true });
-    note('panel', '开启二次验证', { ok: true });
-    return json({ ok: true });
-  }
-  if (op === 'disable') {
-    const secret = await getSecret(env, 'totp_secret');
-    if (!secret || !(await guardedCheck(env, who, async () => (await passwordOk(env, body.password)) && (await totpVerify(secret, String(body.code || ''), env))))) {
-      note('panel', '关闭二次验证', { ok: false, msg: '密码或验证码错误' });
-      throw httpError(403, '密码或验证码错误');
-    }
-    await env.SBYG_KV.delete('totp_secret');
-    await putSettings(env, { ...settings, totp: false });
-    note('panel', '关闭二次验证', { ok: true });
+    await putSettings(env, { ...settings, totp: op === 'enable' });
+    note('panel', act, { ok: true });
     return json({ ok: true });
   }
   throw httpError(404, 'not found');
@@ -637,20 +745,12 @@ export async function totpCode(secret, counter) {
   return String(code).padStart(6, '0');
 }
 
-// 传入 env 时防重放：同一个验证码（时间片）只能使用一次，被他人看到的验证码在有效期内也无法再用
-async function totpVerify(secret, code, env) {
-  if (!/^\d{6}$/.test(code)) return false;
+// 返回匹配的时间片，由 AuthState 事务原子检查并记录使用状态。
+async function totpCounter(secret, code) {
+  if (!/^\d{6}$/.test(code)) return null;
   const c = Math.floor(Date.now() / 30000);
-  for (const d of [-1, 0, 1]) {
-    if ((await totpCode(secret, c + d)) !== code) continue;
-    if (env) {
-      const used = parseInt((await env.SBYG_KV.get('totp_used')) || '0', 10);
-      if (c + d <= used) return false;
-      await env.SBYG_KV.put('totp_used', String(c + d));
-    }
-    return true;
-  }
-  return false;
+  for (const d of [-1, 0, 1]) if ((await totpCode(secret, c + d)) === code) return c + d;
+  return null;
 }
 
 // ------------------------------------------------------------------ IP / CIDR
@@ -739,6 +839,8 @@ async function putSettings(env, settings) {
 
 // 加密数据无法解密时的提示（显示在面板顶部），不含任何密文
 async function secretProblem(env, settings) {
+  const authProblem = (await authState(env, { op: 'problem' })).error;
+  if (authProblem) return authProblem;
   const [raw, t] = await Promise.all([kvJson(env, 'servers', []), env.SBYG_KV.get('totp_secret')]);
   const encd = raw.filter((s) => String(s.token || '').startsWith('enc:v1:'));
   const anyEnc = encd.length || settings._tgEnc || String(settings.tg.token || '').startsWith('enc:v1:') || (t && t.startsWith('enc:v1:'));
@@ -786,12 +888,9 @@ export async function decSecret(env, v) {
   }
 }
 
-async function getSecret(env, name) {
-  return decSecret(env, await env.SBYG_KV.get(name));
-}
-
 async function migrateSecrets(env) {
   if (!env.DATA_KEY) return;
+  await authState(env, { op: 'migrate' });
   const raw = await kvJson(env, 'servers', []);
   if (raw.some((s) => s.token && !String(s.token).startsWith('enc:v1:'))) await putServers(env, await getServers(env));
   const st = await kvJson(env, 'settings', null);
@@ -914,6 +1013,7 @@ async function saveServer(env, body) {
 async function importData(env, data) {
   const arr = (Array.isArray(data) ? data : data && Array.isArray(data.servers) ? data.servers : [data]).slice(0, 200);
   const list = await getServers(env);
+  const restoredIds = new Map();
   let added = 0, updated = 0;
   for (const raw of arr) {
     if (!raw || typeof raw !== 'object') continue;
@@ -922,7 +1022,16 @@ async function importData(env, data) {
     const token = String(raw.token || '').trim();
     if (token.length < 16) continue;
     const i = list.findIndex((s) => s.host === v.host && s.port === v.port);
-    if (i >= 0) { list[i] = { ...list[i], ...v, token }; updated++; } else { list.push({ id: crypto.randomUUID().slice(0, 8), ...v, token, created: Date.now() }); added++; }
+    let server;
+    if (i >= 0) {
+      server = list[i] = { ...list[i], ...v, token };
+      updated++;
+    } else {
+      server = { id: crypto.randomUUID().slice(0, 8), ...v, token, created: Date.now() };
+      list.push(server);
+      added++;
+    }
+    if (raw.id) restoredIds.set(String(raw.id), server.id);
   }
   await putServers(env, list);
   let subs = 0;
@@ -931,6 +1040,14 @@ async function importData(env, data) {
     for (const raw of data.subs.slice(0, 100)) {
       let v;
       try { v = cleanSub(raw); } catch (_) { continue; }
+      const remapNode = (key) => {
+        const split = key.indexOf('|');
+        const old = key.slice(0, split);
+        return split > 0 && old !== 'c' && restoredIds.has(old) ? restoredIds.get(old) + key.slice(split) : key;
+      };
+      v.servers = Array.from(new Set(v.servers.map((id) => restoredIds.get(id) || id)));
+      v.names = Object.fromEntries(Object.entries(v.names).map(([key, name]) => [remapNode(key), name]));
+      v.exclude = v.exclude.map(remapNode);
       const id = /^[\w-]{1,36}$/.test(String(raw.id || '')) ? String(raw.id) : crypto.randomUUID().slice(0, 8);
       if (cur.some((x) => x.id === id) || cur.length >= 100) continue;
       cur.push({ ...v, id, token: /^[a-f0-9]{32}$/.test(String(raw.token || '')) ? raw.token : randHex(16), created: Number(raw.created) || Date.now(), rotated: Date.now() });

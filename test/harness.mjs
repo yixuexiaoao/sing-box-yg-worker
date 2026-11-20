@@ -54,3 +54,36 @@ export function fakeCtx() {
   const pending = [];
   return { waitUntil: (p) => pending.push(p), flush: () => Promise.all(pending.splice(0)) };
 }
+
+// 本地使用真实 AuthState 类，模拟事务回滚和单对象请求串行化。
+export function memoryAuthState(mod, env) {
+  const values = new Map();
+  let queue = Promise.resolve();
+  const clone = (value) => value === undefined ? undefined : structuredClone(value);
+  const storage = {
+    async get(key) { return clone(values.get(key)); },
+    async put(key, value) { values.set(key, clone(value)); },
+    async delete(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) values.delete(key); },
+    async list({ prefix = '', limit = Infinity } = {}) {
+      return new Map([...values].filter(([key]) => key.startsWith(prefix)).sort(([a], [b]) => a.localeCompare(b)).slice(0, limit).map(([key, value]) => [key, clone(value)]));
+    },
+    async setAlarm(time) { storage.alarm = time; },
+    async getAlarm() { return storage.alarm || null; },
+    async transaction(fn) {
+      const before = structuredClone(values);
+      try { return await fn(storage); }
+      catch (e) { values.clear(); for (const [key, value] of before) values.set(key, value); throw e; }
+    },
+  };
+  const state = { storage, blockConcurrencyWhile(fn) {
+    const work = queue.then(fn);
+    queue = work.catch(() => {});
+    return work;
+  } };
+  const object = new mod.AuthState(state, env);
+  return {
+    _storage: storage,
+    idFromName(name) { return name; },
+    get() { return { fetch: (url, options) => object.fetch(new Request(url, options)) }; },
+  };
+}

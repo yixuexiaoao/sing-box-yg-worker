@@ -1,5 +1,6 @@
 name = "sing-box-yg-worker"
 main = "src/worker.js"
+
 compatibility_date = "2026-11-04"
 
 # 通过 workers.dev 子域名访问面板；如只用自定义域名，可改为 false
@@ -21,3 +22,11 @@ id = "243b2cc8e56b4aafb0d1793e4b025bda"
 # 定时任务：每5分钟检测服务器离线/恢复、按设置发送每日流量报告与超额告警、刷新订阅用的节点缓存
 [triggers]
 crons = ["*/5 * * * *"]
+
+[[durable_objects.bindings]]
+name = "AUTH_STATE"
+class_name = "AuthState"
+
+[[migrations]]
+tag = "auth-state-v1"
+new_sqlite_classes = ["AuthState"]

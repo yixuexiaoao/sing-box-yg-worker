@@ -68,10 +68,10 @@
 
 ## 部署
 
-### 方式一：Cloudflare 网页后台（无需本地环境）
+### 方式一：Cloudflare 网页后台准备资源
 
 1. Cloudflare 后台 → **存储和数据库 → KV** → 创建命名空间，例如 `sbyg`
-2. **Workers 和 Pages → 创建 → Worker**，名称随意，部署后点击 **编辑代码**，把 [`src/worker.js`](src/worker.js) 全部内容粘贴进去并部署
+2. **Workers 和 Pages → 创建 → Worker**，名称随意，然后按方式二或方式三部署本仓库，让 Wrangler 创建 `AuthState` Durable Object 与 `AUTH_STATE` 绑定
 3. Worker → **设置 → 绑定** → 添加 **KV 命名空间**，变量名填 `SBYG_KV`，选择第 1 步的命名空间
 4. Worker → **设置 → 变量和机密** → 添加 **机密(Secret)**，名称 `ADMIN_PASSWORD`，值为面板登录密码（建议 16 位以上）；再添加机密 **`DATA_KEY`**（任意长随机字符串，用于加密保存服务器 Token，设置后不要修改）。**两者都必须选择「机密(Secret)」类型**：「文本」类型的变量会在下次从 Git 或 wrangler 部署时被删除
 5. Worker → **设置 → 触发事件** → 添加 **Cron 触发器** `*/5 * * * *`（离线检测、每日报告、刷新节点缓存需要）
@@ -88,6 +88,12 @@ npx wrangler secret put ADMIN_PASSWORD
 npx wrangler secret put DATA_KEY           # 推荐：加密保存服务器 Token，设置后不要修改
 npx wrangler deploy                        # wrangler.toml 已包含每5分钟的 Cron 触发器
 ```
+
+登录失败计数、TOTP 密钥与启用状态、验证码使用记录、会话版本存放在单例 `AuthState` Durable Object，使用 SQLite 存储事务。首次部署会通过 `auth-state-v1` 迁移创建命名空间，首次访问自动读取已有 KV 的 TOTP 配置、验证码记录与会话版本。已有登录密码、DATA_KEY 和服务器配置继续使用。部署时保留 `wrangler.toml` 中的 `durable_objects` 和 `migrations` 配置，缺少绑定会返回 503 并提示重新部署。
+
+首次迁移遇到损坏的 `settings`，或旧设置已开启 TOTP 而 `totp_secret` 缺失时，会暂停鉴权并提示恢复对应 KV 数据，恢复后重新访问即可继续迁移。检测到已有 TOTP 密钥时会保守保留二次验证。旧失败计数仅在迁移后的 15 分钟内按来源首次读取，后续校验使用 Durable Object 状态。
+
+开启 `DATA_KEY` 后，Cron 会同时加密 Durable Object 内的 TOTP 密钥。修改或删除 DATA_KEY 后，已有会话仍能打开面板查看错误提示，TOTP 验证要求恢复原密钥。TOTP 开启后，生成或启用新密钥需要先用密码和当前验证码关闭已有配置。首次升级会清除尚未完成的 TOTP 绑定，重新点击「开启二次验证」即可。
 
 ### 方式三：连接 Git 仓库自动构建（Workers Builds）
 
@@ -117,7 +123,10 @@ npx wrangler deploy                        # wrangler.toml 已包含每5分钟�
 node test/e2e.mjs /path/to/sing-box-yg/sbagent.py /path/to/test/sbox
 # 图表与实际生成的页面脚本回归测试
 node test/charts.mjs
-# 本地预览面板（KV 在内存中，默认密码 admin123）
+# 认证状态迁移、并发处理、备份恢复与审计分页回归
+node test/auth.mjs
+node test/restore-audit.mjs
+# 本地预览仅监听 127.0.0.1，先在当前终端设置 ADMIN_PASSWORD 环境变量
 node test/dev-server.mjs 8787
 ```
 

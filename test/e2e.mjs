@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import { gzipSync } from 'node:zlib';
-import { loadWorker, memoryKV, fakeCtx } from './harness.mjs';
+import { loadWorker, memoryKV, fakeCtx, memoryAuthState } from './harness.mjs';
 
 const [agentPy, sbDir] = process.argv.slice(2);
 let fails = 0;
@@ -100,6 +100,7 @@ const restartAgent = async (perms) => {
 await new Promise((r) => setTimeout(r, 1500));
 
 const env = { ADMIN_PASSWORD: 'pw-123456', SBYG_KV: memoryKV() };
+env.AUTH_STATE = memoryAuthState(mod, env);
 const ctx = fakeCtx();
 let cookie = '';
 let fromIp = '198.51.100.1';
@@ -378,7 +379,7 @@ try {
   cookie = '';
   r = await post('/api/login', { password: 'pw-123456' });
   check(r.status === 401 && r.body.needTotp, 'login asks for TOTP code');
-  const freshCode = async () => { await env.SBYG_KV.delete('totp_used'); return mod.totpCode(secret, Math.floor(Date.now() / 30000)); };
+  const freshCode = async () => { const auth = await env.AUTH_STATE._storage.get('auth'); auth.used = 0; await env.AUTH_STATE._storage.put('auth', auth); return mod.totpCode(secret, Math.floor(Date.now() / 30000)); };
   r = await post('/api/login', { password: 'pw-123456', code });
   check(r.status === 401 && /已使用/.test(r.body.error), 'TOTP code already used for enabling cannot be reused for login');
   const loginCode = await freshCode();
@@ -502,7 +503,7 @@ try {
   check(rawServers().every((x) => String(x.token).startsWith('enc:v1:')) && !JSON.stringify(rawServers()).includes(token), 'cron migrates server tokens to AES-GCM encrypted form');
   const rawSettings = JSON.parse(env.SBYG_KV._map.get('settings').value);
   check(rawSettings.tg.token.startsWith('enc:v1:') && !JSON.stringify(rawSettings).includes('ABCDEFGHIJ'), 'TG bot token encrypted at rest');
-  check((await env.SBYG_KV.get('totp_secret')).startsWith('enc:v1:') && !(await env.SBYG_KV.get('totp_secret')).includes(secret), 'TOTP secret encrypted at rest');
+  check((await env.AUTH_STATE._storage.get('auth')).secret.startsWith('enc:v1:') && !(await env.AUTH_STATE._storage.get('auth')).secret.includes(secret), 'TOTP secret encrypted at rest');
   r = await call('ping');
   check(r.status === 200 && r.body.data.pong, 'servers still reachable with encrypted tokens');
   r = await post('/api/export', { password: 'pw-123456' });
@@ -556,11 +557,11 @@ try {
   check(!h[id].down, 'cron marks server recovered');
 
   // ---------- 持有有效会话时，导出（密码校验）与登录共用同一失败计数
-  await env.SBYG_KV.delete('fail:' + fromIp);
+  await env.AUTH_STATE._storage.delete('fail:' + fromIp);
   for (let i = 0; i < 10; i++) await post('/api/export', { password: 'bad' + i });
   r = await post('/api/export', { password: 'pw-123456' });
   check(r.status === 429, 'export password guessing shares the failure counter (429 after 10 bad tries)');
-  await env.SBYG_KV.delete('fail:' + fromIp);
+  await env.AUTH_STATE._storage.delete('fail:' + fromIp);
   // IPv6 按 /64 合并计数
   fromIp = '2001:db8:1:2::1';
   for (let i = 0; i < 10; i++) await post('/api/export', { password: 'bad' + i });
@@ -568,7 +569,7 @@ try {
   r = await post('/api/export', { password: 'pw-123456' });
   check(r.status === 429, 'IPv6 failures are counted per /64');
   fromIp = '198.51.100.1';
-  await env.SBYG_KV.delete('fail:' + fromIp);
+  await env.AUTH_STATE._storage.delete('fail:' + fromIp);
 
   // ---------- 登录爆破限制
   cookie = '';
