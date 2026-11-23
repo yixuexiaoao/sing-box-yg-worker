@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.5';
+const VERSION = '1.6.6';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -337,11 +337,22 @@ function num(v, lo, hi, name) {
   return n;
 }
 
+function validTimeZone(value) {
+  if (typeof value === 'number' || (typeof value === 'string' && /^[-+]?\d+(\.\d+)?$/.test(value.trim()))) {
+    return num(value, -12, 14, 'UTC 偏移');
+  }
+  if (typeof value === 'string' && value.length <= 80 && /^(?:UTC|[A-Za-z][\w+-]*(?:\/[\w+-]+)+)$/i.test(value.trim())) {
+    try { return new Intl.DateTimeFormat('en', { timeZone: value.trim() }).resolvedOptions().timeZone; }
+    catch (e) { if (!(e instanceof RangeError)) throw e; }
+  }
+  throw httpError(400, '请选择有效的时区，如 Asia/Shanghai，或输入 -12 至 14 的 UTC 偏移小时');
+}
+
 function sanitizeSettings(b, cur, myIp) {
   if (!b || typeof b !== 'object') throw httpError(400, '参数错误');
   const s = JSON.parse(JSON.stringify(cur));
   if (b.title !== undefined) s.title = String(b.title).slice(0, 40) || DEFAULT_SETTINGS.title;
-  if (b.tz !== undefined) s.tz = num(b.tz, -12, 14, '时区');
+  if (b.tz !== undefined) s.tz = validTimeZone(b.tz);
   if (b.sessionHours !== undefined) s.sessionHours = Math.round(num(b.sessionHours, 1, 720, '会话有效期'));
   if (b.reportHour !== undefined) s.reportHour = Math.round(num(b.reportHour, 0, 23, '报告时间'));
   if (b.trafficAlertGB !== undefined) s.trafficAlertGB = num(b.trafficAlertGB, 0, 1e6, '流量告警阈值');
@@ -923,24 +934,57 @@ function validCycle(c) {
   return out;
 }
 
-// 流量周期（按面板时区）：month = 每月第 day 天 00:00 重置（该月没有这一天时取月末）；days = 从 start 起每 len 天一个周期
+// 在 Worker 和浏览器中共享时区转换。wall 用 UTC 字段表示当地日历时间。
+function createZonedClock() {
+  let lastZone, formatter;
+  // 这些方法随函数源码发送到浏览器，保持独立于打包器生成的辅助函数。
+  return {
+    wall(time, zone) {
+      if (typeof zone === 'number') return time + zone * 3600000;
+      if (zone !== lastZone || !formatter) {
+        formatter = new Intl.DateTimeFormat('en', {
+          timeZone: zone, calendar: 'gregory', numberingSystem: 'latn', hourCycle: 'h23',
+          year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+        });
+        lastZone = zone;
+      }
+      const p = Object.fromEntries(formatter.formatToParts(time).map(({ type, value }) => [type, Number(value)]));
+      const date = new Date(0);
+      date.setUTCFullYear(p.year, p.month - 1, p.day);
+      date.setUTCHours(p.hour, p.minute, p.second, ((time % 1000) + 1000) % 1000);
+      return date.getTime();
+    },
+    instant(local, zone, strict = false) {
+      if (!Number.isFinite(local)) return NaN;
+      if (typeof zone === 'number') return local - zone * 3600000;
+      // 取转换前后的偏移。重叠时选较早的时间，缺失的用户输入则拒绝。
+      const candidates = [local - 86400000, local + 86400000].map((t) => local - (this.wall(t, zone) - t)).sort((a, b) => a - b);
+      return candidates.find((t) => this.wall(t, zone) === local) ?? (strict ? NaN : candidates[1]);
+    },
+  };
+}
+
+const zonedClock = createZonedClock();
+
+// 流量周期按面板时区的日历日计算。
 export function cyclePeriods(cycle, nowMs, tz) {
-  const off = tz * 3600000;
+  const local = new Date(zonedClock.wall(nowMs, tz));
   if (cycle.mode === 'month') {
     const at = (y, m) => {
       const first = new Date(Date.UTC(y, m, 1));
       const dim = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
-      return Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), Math.min(cycle.day, dim)) - off;
+      return zonedClock.instant(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), Math.min(cycle.day, dim)), tz);
     };
-    const local = new Date(nowMs + off);
     let y = local.getUTCFullYear(), mo = local.getUTCMonth();
     if (at(y, mo) > nowMs) mo -= 1;
     return { cur: [at(y, mo), at(y, mo + 1)], prev: [at(y, mo - 1), at(y, mo)] };
   }
-  const s0 = Date.parse(cycle.start + 'T00:00:00Z') - off;
+  const s0 = Date.parse(cycle.start + 'T00:00:00Z');
   const L = cycle.len * 86400000;
-  const start = s0 + Math.floor((nowMs - s0) / L) * L;
-  return { cur: [start, start + L], prev: [start - L, start] };
+  let start = s0 + Math.floor((local.getTime() - s0) / L) * L;
+  const at = (t) => zonedClock.instant(t, tz);
+  if (at(start) > nowMs) start -= L;
+  return { cur: [at(start), at(start + L)], prev: [at(start - L), at(start)] };
 }
 
 function cycleUsage(d, cycle) {
@@ -1441,12 +1485,15 @@ export async function cronTick(env, now = Date.now()) {
     await env.SBYG_KV.put(hourKey, '1', { expirationTtl: 7200 });
     await cycleCheck(env, settings, servers, now);
   }
-  const local = new Date(now + settings.tz * 3600000);
-  const day = local.toISOString().slice(0, 10);
   const wantReport = settings.tg.events.daily || (settings.tg.events.traffic && settings.trafficAlertGB > 0);
-  if (wantReport && local.getUTCHours() === settings.reportHour && !(await env.SBYG_KV.get('report:' + day))) {
-    await env.SBYG_KV.put('report:' + day, '1', { expirationTtl: 172800 });
-    await dailyReport(env, settings, servers, local);
+  if (wantReport) {
+    const day = new Date(zonedClock.wall(now, settings.tz)).toISOString().slice(0, 10);
+    const midnight = Date.parse(day + 'T00:00:00Z');
+    const reportAt = zonedClock.instant(midnight + settings.reportHour * 3600000, settings.tz);
+    if (now >= reportAt && now < reportAt + 3600000 && !(await env.SBYG_KV.get('report:' + day))) {
+      await env.SBYG_KV.put('report:' + day, '1', { expirationTtl: 172800 });
+      await dailyReport(env, settings, servers, midnight);
+    }
   }
   // 每次最多刷新一台缓存过期的服务器节点链接，供订阅使用
   const stale = [];
@@ -1462,7 +1509,7 @@ async function cycleCheck(env, settings, servers, now) {
   await mapLimit(servers.filter((s) => s.cycle && s.cycle.mode !== 'off'), 3, async (s) => {
     let d;
     try { d = await serverCycle(s, settings, now); } catch (_) { return; }
-    const day = (t) => new Date(t + settings.tz * 3600000).toISOString().slice(0, 10);
+    const day = (t) => new Date(zonedClock.wall(t, settings.tz)).toISOString().slice(0, 10);
     const span = (x) => day(x.start) + ' ~ ' + day(x.end - 1);
     const fmtq = (x) => fmtBytes(x.used) + (x.quota ? ' / ' + fmtBytes(x.quota) + '（' + x.pct + '%）' : '');
     // 上一周期结算：每个周期只发送一次
@@ -1481,10 +1528,11 @@ async function cycleCheck(env, settings, servers, now) {
   });
 }
 
-async function dailyReport(env, settings, servers, local) {
-  const midnight = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate()) - settings.tz * 3600000;
-  const start = (midnight - 86400000) / 1000;
-  const end = midnight / 1000;
+async function dailyReport(env, settings, servers, midnight) {
+  const yesterday = midnight - 86400000;
+  // 与账期相同，将跨日界的流量小时桶归入新一天。
+  const start = Math.floor(zonedClock.instant(yesterday, settings.tz) / 3600000) * 3600;
+  const end = Math.floor(zonedClock.instant(midnight, settings.tz) / 3600000) * 3600;
   const lines = [];
   const alerts = [];
   await mapLimit(servers, 5, async (s) => {
@@ -1498,7 +1546,7 @@ async function dailyReport(env, settings, servers, local) {
       lines.push('• ' + s.name + '：获取失败（' + e.message + '）');
     }
   });
-  const date = new Date(midnight - 86400000 + settings.tz * 3600000).toISOString().slice(0, 10);
+  const date = new Date(yesterday).toISOString().slice(0, 10);
   if (settings.tg.events.daily) await tgSend(settings, '📊 ' + date + ' 流量日报\n' + lines.join('\n'));
   if (alerts.length) await tgEvent(settings, 'traffic', alerts.join('\n'));
 }
@@ -1736,7 +1784,7 @@ let PAGE_PARTS = null;
 function pageParts() {
   if (!PAGE_PARTS) {
     const a = PAGE.indexOf('<script>'), b = PAGE.lastIndexOf('</script>');
-    const js = PAGE.slice(a + 8, b);
+    const js = 'const createZonedClock = (' + createZonedClock.toString() + ');\n' + PAGE.slice(a + 8, b);
     let h = 0x811c9dc5; // FNV-1a 32位
     for (let i = 0; i < js.length; i++) { h ^= js.charCodeAt(i); h = Math.imul(h, 0x01000193); }
     PAGE_PARTS = { head: PAGE.slice(0, a), tail: PAGE.slice(b + 9), js, src: '/app.' + (h >>> 0).toString(16).padStart(8, '0') + '.js' };
@@ -1870,7 +1918,10 @@ function call(id,action,params){return api('/api/servers/'+id+'/call',{body:{act
 function toast(msg){var t=document.createElement('div');t.className='toast';t.textContent=msg;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
 function fmtBytes(n){n=Number(n)||0;var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){n/=1024;i++}return (i?n.toFixed(2):n)+' '+u[i]}
 function fmtUp(s){s=s||0;var d=Math.floor(s/86400),h=Math.floor(s%86400/3600);return d?d+'天'+h+'时':h+'时'+Math.floor(s%3600/60)+'分'}
-function fmtTime(t){if(!t)return '-';var d=new Date(t);function p(x){return (x<10?'0':'')+x}return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())}
+var panelClock=createZonedClock();
+function panelZone(){return S.me&&S.me.settings?S.me.settings.tz:8}
+function zoneLabel(tz){return typeof tz==='number'?'UTC'+(tz>=0?'+':'')+tz:tz}
+function fmtTime(t){if(!t||!Number.isFinite(Number(t)))return '-';return new Date(panelClock.wall(Number(t),panelZone())).toISOString().slice(0,19).replace('T',' ')}
 function copy(text){(navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject()).then(function(){toast('已复制')},function(){var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove();toast('已复制')})}
 function srvById(id){for(var i=0;i<S.servers.length;i++)if(S.servers[i].id===id)return S.servers[i]}
 function val(id){var e=$(id);return e?String(e.value).trim():''}
@@ -1882,8 +1933,9 @@ function closeModal(){var m=$('modal');if(m)m.remove()}
 document.addEventListener('click',function(e){var t=e.target.closest('[data-close]');if(t)closeModal();var c=e.target.closest('[data-copy]');if(c)copy(c.getAttribute('data-copy'))});
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeModal()});
 function bind(root,sel,fn){(root||document).querySelectorAll(sel).forEach(function(el){el.addEventListener('click',function(ev){ev.preventDefault();fn(el,ev)})})}
-function localInput(t){var d=new Date(t);d.setMinutes(d.getMinutes()-d.getTimezoneOffset());return d.toISOString().slice(0,16)}
-function inputTime(id){var v=val(id);return v?Math.floor(new Date(v).getTime()/1000):null}
+function localInput(t){return new Date(panelClock.wall(t,panelZone())).toISOString().slice(0,16)}
+function readDateTime(id){var v=val(id);return v?panelClock.instant(Date.parse(v+'Z'),panelZone(),true):null}
+function inputTime(id){var t=readDateTime(id);return Number.isFinite(t)?Math.floor(t/1000):null}
 function busy(el,text){el.innerHTML='<p class="muted" style="padding:8px">'+(text||'加载中…')+'</p>'}
 function fail(el,e){el.innerHTML='<p class="err" style="padding:8px">'+esc(e.message||e)+'</p>'}
 
@@ -1997,8 +2049,7 @@ function updateSummary(){
 var PERM_NAMES={read:'只读',links:'节点链接',manage:'管理',upgrade:'远程升级'};
 function permissionText(perms){return Array.isArray(perms)?esc(perms.map(function(p){return Object.hasOwn(PERM_NAMES,p)?PERM_NAMES[p]:p}).join('、')):'-'}
 function cycleDate(t,tz){
- var off=Number(tz);if(!Number.isFinite(off))off=Number(S.me&&S.me.settings&&S.me.settings.tz)||0;
- var date=new Date(Number(t)+off*3600000);return Number.isFinite(date.getTime())?date.toISOString().slice(0,10):'—';
+ return Number.isFinite(t)?new Date(panelClock.wall(t,tz==null?panelZone():tz)).toISOString().slice(0,10):'—';
 }
 function cycleTools(s,details){return '<div class="cycle-tools">'+(details?'<button data-act="cycletraffic" data-id="'+esc(s.id)+'">查看明细</button>':'')+'<button data-act="cycleedit" data-id="'+esc(s.id)+'">设置流量周期</button></div>'}
 function serverMetrics(d){
@@ -2043,7 +2094,7 @@ function cardHtml(s){
   '<span>日志</span><span>'+(d.log&&d.log.enabled?'已开启 '+fmtBytes(d.log.size)+(d.log.archives?'（归档'+d.log.archives+'份）':''):'<span class="err">未开启</span>')+'</span>'+
   '<span>流量</span><span>'+(tr.enabled?'统计中 '+fmtBytes(tr.db_size):'<span class="muted">未开启</span>')+'</span>'+cycleHtml(s)+
   '<span>API权限</span><span>'+permissionText(ap.perms)+(ap.allow&&ap.allow.length?' · IP白名单':'')+'</span>'+
-  '<span>重置</span><span>'+(d.last_reset?esc(d.last_reset.time)+' ('+esc((d.last_reset.items||[]).join(','))+')':'从未')+(d.schedule?' · 已设定时':'')+(d.leak&&d.leak.enabled?' · 泄露检测':'')+'</span>'+
+  '<span>重置（服务器时间）</span><span>'+(d.last_reset?esc(d.last_reset.time)+' ('+esc((d.last_reset.items||[]).join(','))+')':'从未')+(d.schedule?' · 已设定时':'')+(d.leak&&d.leak.enabled?' · 泄露检测':'')+'</span>'+
   (d.argo&&(d.argo.temp||d.argo.fixed)?'<span>Argo</span><span>'+esc(d.argo.fixed||d.argo.temp)+'</span>':'')+'</div></details>';
  }
  var b=function(act,label,cls){return '<button data-act="'+act+'" data-id="'+esc(s.id)+'"'+(cls?' class="'+cls+'"':'')+'>'+label+'</button>'};
@@ -2200,7 +2251,7 @@ function logsDialog(s,preset){
   var out=$('l-out');busy(out);
   call(s.id,'logs',{ip:val('l-ip'),q:val('l-q'),proto:val('l-proto'),hours:val('l-hours')?Number(val('l-hours')):null,limit:Number(val('l-limit')),err:checked('l-err'),hidelocal:checked('l-local')})
   .then(function(d){
-   $('l-info').textContent=(d.enabled?'':'⚠ 连接日志未开启（在「日志/流量/定时」中开启）。 ')+'日志 '+fmtBytes(d.size)+'，记录范围 '+(d.first||'-')+' ~ '+(d.last||'-')+'，显示 '+d.matched+' 条 / 共 '+d.total+' 条';
+   $('l-info').textContent=(d.enabled?'':'⚠ 连接日志未开启（在「日志/流量/定时」中开启）。 ')+'日志 '+fmtBytes(d.size)+'，记录范围（服务器时间） '+(d.first||'-')+' ~ '+(d.last||'-')+'，显示 '+d.matched+' 条 / 共 '+d.total+' 条';
    if(!d.records.length){out.innerHTML='<p class="muted" style="padding:8px">没有匹配的记录</p>';return}
    out.innerHTML='<table><thead><tr><th>时间</th><th>协议</th><th>源IP</th><th>端口</th><th>访问目标</th><th>网络</th><th>出站</th><th>备注</th></tr></thead><tbody>'+
    d.records.map(function(r){var tgt=r.domain||r.dst||'';var note=(r.domain&&r.dst&&r.domain!==r.dst?'原始目标 '+r.dst+' ':'')+(r.odst?'出站目标 '+r.odst+' ':'')+(r.user?'用户 '+r.user+' ':'');
@@ -2320,7 +2371,7 @@ function settingsDialog(s){
   '<div class="section"><h3>流量统计</h3><p class="small">状态：'+(tr.enabled?'统计中，数据库 '+fmtBytes(tr.db_size)+'，保留 '+esc(tr.retain_days)+' 天'+(tr.collector&&tr.collector!=='ok'?' <span class="err">采集异常：'+esc(tr.collector)+'</span>':''):'<span class="muted">未开启</span>')+(tr.available===false?' <span class="err">（缺少sqlite3）</span>':'')+'</p>'+
   '<div class="bar"><button data-do="trafficon">开启</button><button data-do="trafficoff">关闭</button>保留天数 <input id="g-tr" type="number" style="width:80px" value="'+esc(tr.retain_days||90)+'"><button id="g-trs">保存</button></div>'+
   '<div class="bar small" style="margin-top:8px">按时间段删除流量记录：<input type="datetime-local" id="g-ts" value="'+localInput(now-90*86400000)+'"> 至 <input type="datetime-local" id="g-te" value="'+localInput(now-30*86400000)+'"><button id="g-tprune" class="danger">删除</button></div></div>'+
-  '<div class="section"><h3>定时自动重置（UUID+Reality+订阅路径）</h3><p class="small muted">'+esc(d.schedule||'未设置')+'</p><div class="bar"><button data-sch="daily">每天04:00</button><button data-sch="weekly">每周一04:00</button><button data-sch="off">关闭</button></div></div>'+
+  '<div class="section"><h3>定时自动重置（服务器时区）</h3><p class="small muted">'+esc(d.schedule||'未设置')+'</p><div class="bar"><button data-sch="daily">每天04:00</button><button data-sch="weekly">每周一04:00</button><button data-sch="off">关闭</button></div></div>'+
   '<div class="section"><h3>泄露检测（每小时一次）</h3>'+
   '<div class="bar small"><label><input type="checkbox" id="g-len"'+(lk.enabled?' checked':'')+'>开启</label> 最近 <input id="g-lh" type="number" style="width:70px" value="'+esc(lk.hours||24)+'"> 小时内，不同源IP超过 <input id="g-lt" type="number" style="width:70px" value="'+esc(lk.threshold||10)+'"> 个时'+
   '<select id="g-la"><option value="notify"'+(lk.action!=='reset'?' selected':'')+'>仅TG通知</option><option value="reset"'+(lk.action==='reset'?' selected':'')+'>自动重置并TG推送</option></select><button id="g-lsave" class="primary">保存</button><button id="g-lcheck">立即检测</button></div><div id="g-lres" class="small" style="margin-top:6px"></div></div>'+
@@ -2329,9 +2380,17 @@ function settingsDialog(s){
   bind($('g-out'),'[data-do]',function(b){var a=b.getAttribute('data-do');if(a==='clearlog'&&!confirm('清空全部日志（含归档）？'))return;act(a,{},'已完成',true)});
   bind($('g-out'),'[data-sch]',function(b){act('schedule',{mode:b.getAttribute('data-sch'),items:'all'},'已保存',true)});
   $('g-pol').addEventListener('click',function(){act('logpolicy',{max_mb:Number(val('g-mb')),keep:Number(val('g-keep')),retain_days:Number(val('g-rd')),compress:checked('g-gz')},'日志策略已保存',true)});
-  $('g-lprune').addEventListener('click',function(){if(confirm('删除该时间段的日志？'))act('logprune',{start:inputTime('g-ls'),end:inputTime('g-le')},'已删除',true).then(function(r){if(r)toast('删除 '+r.removed_lines+' 行')})});
+  $('g-lprune').addEventListener('click',function(){
+   var start=inputTime('g-ls'),end=inputTime('g-le');
+   if(start===null||end===null||start>=end)return toast('请选择有效的时间范围');
+   if(confirm('删除该时间段的日志？'))act('logprune',{start:start,end:end},'已删除',true).then(function(r){if(r)toast('删除 '+r.removed_lines+' 行')});
+  });
   $('g-trs').addEventListener('click',function(){act('trafficconf',{retain_days:Number(val('g-tr'))},'已保存',true)});
-  $('g-tprune').addEventListener('click',function(){if(confirm('删除该时间段的流量记录？'))act('trafficpurge',{start:inputTime('g-ts'),end:inputTime('g-te')},'已删除',true)});
+  $('g-tprune').addEventListener('click',function(){
+   var start=inputTime('g-ts'),end=inputTime('g-te');
+   if(start===null||end===null||start>=end)return toast('请选择有效的时间范围');
+   if(confirm('删除该时间段的流量记录？'))act('trafficpurge',{start:start,end:end},'已删除',true);
+  });
   $('g-lsave').addEventListener('click',function(){act('leakconf',{enabled:checked('g-len'),hours:Number(val('g-lh')),threshold:Number(val('g-lt')),action:val('g-la'),items:'all'},'已保存')});
   $('g-lcheck').addEventListener('click',function(){call(s.id,'leakcheck').then(function(r){$('g-lres').innerHTML='最近 '+esc(r.hours)+' 小时：'+esc(r.unique_ips)+' 个源IP（阈值 '+esc(r.threshold)+'）'+(r.exceeded?' <b class="err">已超过阈值</b>':' 正常')+'<br>'+r.ips.slice(0,20).map(function(x){return esc(x[0])+'('+esc(x[1])+')'}).join('，')}).catch(function(e){toast(e.message)})});
  }).catch(function(e){fail($('g-out'),e)});
@@ -2339,7 +2398,7 @@ function settingsDialog(s){
 
 // ---------- API 审计日志（服务器端）
 function apilogDialog(s){
- modal('API访问审计日志 · '+esc(s.name),'<p class="small muted">记录服务器API收到的修改操作、权限拒绝、认证失败封禁等（高频只读查询不记录）</p><div class="tablewrap" id="al-out"></div>');
+ modal('API访问审计日志 · '+esc(s.name),'<p class="small muted">时间使用服务器时区。记录修改操作、权限拒绝和认证失败封禁等事件。</p><div class="tablewrap" id="al-out"></div>');
  busy($('al-out'));
  call(s.id,'apilog',{lines:500}).then(function(d){
   $('al-out').innerHTML=d.entries.length?'<table><thead><tr><th>时间</th><th>来源IP</th><th>操作</th><th>结果</th><th>参数/错误</th></tr></thead><tbody>'+d.entries.map(function(e){return '<tr><td>'+esc(e.time)+'</td><td>'+esc(e.ip)+geoSpan(e.ip)+'</td><td>'+esc(e.action)+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.error||JSON.stringify(e.params||{}))+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">暂无记录</p>';
@@ -2405,7 +2464,7 @@ function viewTraffic(){
  S.servers.map(function(s){return '<option value="s:'+esc(s.id)+'">'+esc(s.name)+'</option>'}).join('')+'</select>'+
  '<select id="t-range">'+RANGES.map(function(r){return '<option value="'+r[0]+'">'+r[1]+'</option>'}).join('')+'</select>'+
  '<span id="t-custom" hidden><input type="datetime-local" id="t-start" value="'+localInput(now-86400000)+'"> 至 <input type="datetime-local" id="t-end" value="'+localInput(now)+'"></span>'+
- '<select id="t-group">'+DIMS.map(function(g){return '<option value="'+g[0]+'">按'+g[1]+'</option>'}).join('')+'</select>'+
+ '<select id="t-group">'+DIMS.map(function(g){return '<option value="'+g[0]+'">按'+g[1]+(['hour','day','month'].includes(g[0])?'（服务器时区）':'')+'</option>'}).join('')+'</select>'+
  '<select id="t-sort"><option value="bytes">按合计排序</option><option value="up">按上行排序</option><option value="down">按下行排序</option><option value="conns">按连接数排序</option></select>'+
  '<select id="t-limit"><option>50</option><option selected>200</option><option>1000</option></select></div>'+
  '<div class="bar" style="margin-top:6px"><input id="t-ip" placeholder="源IP" size="16"><input id="t-host" placeholder="访问地址/域名" size="18"><label class="small"><input type="checkbox" id="t-exact">精确匹配</label>'+
@@ -2414,7 +2473,7 @@ function viewTraffic(){
  '<input id="t-loc" placeholder="归属地/运营商筛选" size="14" title="作用于源IP类结果，如 日本、移动、Google"><input id="t-min" type="number" min="0" placeholder="最少MB" style="width:80px">'+
  '<label class="small"><input type="checkbox" id="t-split" checked>按服务器分别显示</label>'+
  '<button class="primary" id="t-go">查询</button><button id="t-reset">重置条件</button><button id="t-csv">导出CSV</button></div>'+
- '<p class="small muted" style="margin:6px 0 0">点击表格中的项目逐级下钻，用路径或「返回上一级」回退；多台服务器时默认按服务器分别列出，可明确看到同一IP经过哪台服务器访问了哪些地址。IP归属地来自公开IP库，缓存30天。</p></div>'+
+ '<p class="small muted" style="margin:6px 0 0">查询时区 '+esc(zoneLabel(panelZone()))+'。点击表格项目可逐级查看明细。IP归属地缓存30天。</p></div>'+
  '<div class="bar" id="t-crumb" style="margin-bottom:8px"></div><div id="t-sum" style="margin-bottom:10px"></div><div id="t-srvsum"></div><div id="t-chart"></div><div class="tablewrap" id="t-out"></div>';
  $('t-range').addEventListener('change',function(){$('t-custom').hidden=val('t-range')!=='custom'});
  $('t-go').addEventListener('click',function(){TS.preservePreference=false;TS.stack=[{label:'查询',q:readControls()}];runTraffic()});
@@ -2435,10 +2494,11 @@ function writeControls(q){$('t-scope').value=q.scope||'';$('t-range').value=q.ra
  $('t-group').value=q.group;$('t-sort').value=q.sort||'bytes';$('t-limit').value=String(q.limit||200);$('t-ip').value=q.ip||'';$('t-host').value=q.host||'';$('t-exact').checked=!!q.exact;
  $('t-in').value=q.inbound&&PROTOS.some(function(p){return p[0]===q.inbound})?q.inbound:'';$('t-outb').value=q.outbound&&['direct','warp','socks'].indexOf(q.outbound)>=0?q.outbound:'';$('t-loc').value=q.loc||'';$('t-min').value=q.minmb||'';$('t-split').checked=q.split!==false}
 function rangeOf(q){
- var now=new Date(),t=Math.floor(now.getTime()/1000),d0=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime()/1000;
- var m0=new Date(now.getFullYear(),now.getMonth(),1).getTime()/1000,lm0=new Date(now.getFullYear(),now.getMonth()-1,1).getTime()/1000;
- var r={today:[d0,t],yesterday:[d0-86400,d0],'24h':[t-86400,t],'7d':[t-7*86400,t],'30d':[t-30*86400,t],month:[m0,t],lastmonth:[lm0,m0],custom:[q.cstart,q.cend]}[q.range||'24h'];
- if(r){if(!r[0]||!r[1]||r[0]>=r[1])return Promise.reject(new Error('请选择有效的时间范围'));return Promise.resolve(r)}
+ var now=Date.now(),t=Math.floor(now/1000),zone=panelZone(),local=new Date(panelClock.wall(now,zone));
+ var y=local.getUTCFullYear(),m=local.getUTCMonth(),d=local.getUTCDate();
+ function at(month,day){return Math.floor(panelClock.instant(Date.UTC(y,month,day),zone)/1000)}
+ var r={today:[at(m,d),t],yesterday:[at(m,d-1),at(m,d)],'24h':[t-86400,t],'7d':[t-7*86400,t],'30d':[t-30*86400,t],month:[at(m,1),t],lastmonth:[at(m-1,1),at(m,1)],custom:[q.cstart,q.cend]}[q.range||'24h'];
+ if(r){if(!Number.isFinite(r[0])||!Number.isFinite(r[1])||r[0]>=r[1])return Promise.reject(new Error('请选择有效的时间范围'));return Promise.resolve(r)}
  var list=scopeServers(q.scope);
  if(list.length!==1||!list[0].cycle||list[0].cycle.mode==='off')return Promise.reject(new Error('「流量周期」需选择单台已设置周期的服务器（在服务器「编辑」中设置）'));
  return api('/api/servers/'+list[0].id+'/cycle',{body:{}}).then(function(j){var p=q.range==='cycle'?j.data.cur:j.data.prev;return [Math.floor(p.start/1000),Math.floor(Math.min(p.queryEnd==null?p.end:p.queryEnd,Date.now())/1000)]});
@@ -2718,7 +2778,9 @@ function editSub(s){
  $('e-clr').addEventListener('click',function(){if(confirm('清空全部单独命名？（将按模板或原名称显示）')){names={};draw()}});
  $('e-save').addEventListener('click',function(){
   collect();
-  var body={id:s.id,name:val('e-name'),expires:val('e-exp')?new Date(val('e-exp')).getTime():0,rename:checked('e-ren'),tpl:val('e-tpl'),enabled:checked('e-en'),custom:$('e-custom').value,note:val('e-note'),
+  var expires=val('e-exp')===ex?(s.expires||0):readDateTime('e-exp')??0;
+  if(!Number.isFinite(expires))return toast('请选择有效的到期时间');
+  var body={id:s.id,name:val('e-name'),expires:expires,rename:checked('e-ren'),tpl:val('e-tpl'),enabled:checked('e-en'),custom:$('e-custom').value,note:val('e-note'),
    servers:selServers(),protos:selProtos(),names:names,exclude:Object.keys(exclude)};
   api('/api/subs',{body:body}).then(function(j){closeModal();drawSubs(j.data);toast('已保存')}).catch(function(e){$('e-err').textContent=e.message});
  });
@@ -2732,12 +2794,14 @@ function viewAudit(){
  $('view').innerHTML='<div class="card" style="margin-bottom:10px"><div class="bar"><select id="a-kind"><option value="">全部类型</option><option value="login">登录</option><option value="op">服务器操作</option><option value="panel">面板变更</option></select>'+
  '<input id="a-ip" placeholder="IP" size="14"><input id="a-q" placeholder="关键字（操作/服务器/详情）" size="20"><input type="datetime-local" id="a-from"> 至 <input type="datetime-local" id="a-to">'+
  '<button class="primary" id="a-go">查询</button></div><div class="bar small" style="margin-top:8px">清理：删除 <input type="datetime-local" id="a-pf" value="'+localInput(now-365*86400000)+'"> 至 <input type="datetime-local" id="a-pt" value="'+localInput(now-7*86400000)+'"> 的记录<button id="a-purge" class="danger">删除</button>'+
- '<span class="muted">（删除需二次验证；审计日志按「设置」中的保留天数自动过期）</span></div></div><div class="tablewrap" id="a-out"></div><div style="margin-top:8px"><button id="a-more" hidden>加载更多</button></div>';
+ '<span class="muted">时区 '+esc(zoneLabel(panelZone()))+'。删除需二次验证。</span></div></div><div class="tablewrap" id="a-out"></div><div style="margin-top:8px"><button id="a-more" hidden>加载更多</button></div>';
  var cursor=null,items=[];
  function q(more){
+  var from=readDateTime('a-from'),to=readDateTime('a-to');
+  if(Number.isNaN(from)||Number.isNaN(to)||(from!==null&&to!==null&&from>to))return toast('请选择有效的时间范围');
   if(!more){items=[];cursor=null;busy($('a-out'))}
   var qs='kind='+encodeURIComponent(val('a-kind'))+'&ip='+encodeURIComponent(val('a-ip'))+'&q='+encodeURIComponent(val('a-q'))+'&limit=200'+
-   (val('a-from')?'&from='+new Date(val('a-from')).getTime():'')+(val('a-to')?'&to='+new Date(val('a-to')).getTime():'')+(more&&cursor?'&cursor='+encodeURIComponent(cursor):'');
+   (from!==null?'&from='+from:'')+(to!==null?'&to='+to:'')+(more&&cursor?'&cursor='+encodeURIComponent(cursor):'');
   api('/api/audit?'+qs).then(function(j){items=items.concat(j.data.items);cursor=j.data.cursor;$('a-more').hidden=!cursor;
    $('a-out').innerHTML=items.length?'<table><thead><tr><th>时间</th><th>类型</th><th>操作</th><th>服务器</th><th>IP</th><th>结果</th><th>详情</th></tr></thead><tbody>'+items.map(function(e){
     return '<tr><td>'+fmtTime(e.t)+'</td><td>'+esc(KINDS[e.k]||e.k)+'</td><td>'+esc(e.a)+'</td><td>'+esc(e.s)+'</td><td>'+(e.ip&&e.ip!=='unknown'?esc(e.ip)+geoSpan(e.ip):'<span class="muted">未知</span>')+(e.cc?' <span class="chip">'+esc(e.cc)+'</span>':'')+'</td><td class="'+(e.ok?'okc':'err')+'">'+(e.ok?'成功':'失败')+'</td><td class="wrap">'+esc(e.m)+(e.u?' <span class="muted">'+esc(e.u)+'</span>':'')+'</td></tr>'}).join('')+'</tbody></table>':'<p class="muted" style="padding:8px">没有记录</p>';
@@ -2748,7 +2812,8 @@ function viewAudit(){
  $('a-more').addEventListener('click',function(){q(true)});
  $('a-purge').addEventListener('click',function(){
   if(!S.me.settings.totp)return toast('删除审计日志需要二次验证，请先在「设置 → 安全」中开启二次验证');
-  var from=new Date(val('a-pf')).getTime(),to=new Date(val('a-pt')).getTime();
+  var from=readDateTime('a-pf'),to=readDateTime('a-pt');
+  if(!Number.isFinite(from)||!Number.isFinite(to)||from>=to)return toast('请选择有效的时间范围');
   modal('删除审计日志','<p class="small">将删除 '+fmtTime(from)+' 至 '+fmtTime(to)+' 的审计日志，此操作不可恢复，并会记入新的审计日志。</p><div class="bar"><input id="ap-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6位二次验证码"><button class="danger" id="ap-go">验证并删除</button></div><p class="err small" id="ap-err"></p>',true);
   $('ap-go').addEventListener('click',function(){api('/api/audit/purge',{body:{from:from,to:to,code:val('ap-code')}}).then(function(j){closeModal();toast('已删除 '+j.data.deleted+' 条');q(false)}).catch(function(e){$('ap-err').textContent=e.message})});
  });
@@ -2758,9 +2823,12 @@ function viewAudit(){
 // ================= 设置
 function viewSettings(){
  api('/api/me').then(function(j){S.me=j;var st=j.settings,ev=j.events;
+  var browserZone=Intl.DateTimeFormat().resolvedOptions().timeZone;
+  var zones=Array.from(new Set(['UTC','Asia/Shanghai',browserZone].concat(typeof Intl.supportedValuesOf==='function'?Intl.supportedValuesOf('timeZone'):[])));
   $('view').innerHTML=
   '<div class="card section"><h3>基本</h3><div class="row"><div class="field"><span class="small muted">面板标题</span><input id="c-title" value="'+esc(st.title)+'"></div>'+
-  '<div class="field"><span class="small muted">时区（UTC偏移小时，用于报告）</span><input id="c-tz" type="number" value="'+esc(st.tz)+'"></div>'+
+  '<div class="field"><label class="small muted" for="c-tz">面板时区</label><div class="bar"><input id="c-tz" list="c-zones" value="'+esc(st.tz)+'" placeholder="Asia/Shanghai 或 8"><button type="button" id="c-localtz">使用浏览器时区</button></div>'+
+  '<datalist id="c-zones">'+zones.map(function(zone){return '<option value="'+esc(zone)+'"></option>'}).join('')+'</datalist><span class="small muted">用于时间显示、筛选、流量周期和日报。地区时区会随夏令时调整，也支持固定 UTC 偏移小时。</span></div>'+
   '<div class="field"><span class="small muted">登录有效期（小时）</span><input id="c-sess" type="number" value="'+esc(st.sessionHours)+'"></div>'+
   '<div class="field"><span class="small muted">审计日志保留天数（缩短需二次验证码）</span><input id="c-ad" type="number" value="'+esc(st.auditDays)+'"></div>'+
   '<div class="field"><span class="small muted">二次验证码（缩短保留天数时填写）</span><input id="c-adcode" inputmode="numeric" placeholder="6位验证码"></div>'+
@@ -2776,14 +2844,15 @@ function viewSettings(){
   '<div class="bar"><button id="c-tgtest">发送测试消息</button>'+(st.tg.tokenSet?'<label><input type="checkbox" id="c-tgclr">清除已保存的Token</label>':'')+'</div></div>'+
   '<div class="card section"><h3>监控与报告（由 Cron 每5分钟执行）</h3><div class="row"><div class="field"><label><input type="checkbox" id="c-mon"'+(st.monitor.enabled?' checked':'')+'>离线检测</label></div>'+
   '<div class="field"><span class="small muted">连续失败几次判定离线</span><input id="c-fc" type="number" value="'+esc(st.monitor.failCount)+'"></div>'+
-  '<div class="field"><span class="small muted">每日报告时间（0-23点）</span><input id="c-rh" type="number" value="'+esc(st.reportHour)+'"></div>'+
+  '<div class="field"><span class="small muted">每日报告时间（面板时区，0-23点）</span><input id="c-rh" type="number" value="'+esc(st.reportHour)+'"></div>'+
   '<div class="field"><span class="small muted">单台服务器日流量告警阈值（GB，0关闭）</span><input id="c-ta" type="number" value="'+esc(st.trafficAlertGB)+'"></div></div><div id="c-health" class="small muted"></div></div>'+
   '<button class="primary" id="c-save">保存设置</button> <span id="c-err" class="err small"></span>';
   $('c-geo').value=st.geo||'ipwhois';
+  $('c-localtz').addEventListener('click',function(){$('c-tz').value=browserZone});
   api('/api/health').then(function(h){var ids=Object.keys(h.data);$('c-health').textContent=ids.length?'检测状态：'+ids.map(function(id){var x=h.data[id],s=srvById(id);return (s?s.name:id)+(x.down?' 离线':' 正常')+(x.fails?'(失败'+x.fails+'次)':'')}).join('；'):'尚未运行检测（部署后Cron每5分钟执行）'}).catch(function(){});
   $('c-save').addEventListener('click',function(){
    var events={};document.querySelectorAll('[data-ev]').forEach(function(c){events[c.getAttribute('data-ev')]=c.checked});
-   var body={title:val('c-title'),tz:Number(val('c-tz')),sessionHours:Number(val('c-sess')),auditDays:Number(val('c-ad')),totpCode:val('c-adcode'),geo:val('c-geo'),linkCacheHours:Number(val('c-lc')),loginAllow:$('c-allow').value,
+   var body={title:val('c-title'),tz:val('c-tz'),sessionHours:Number(val('c-sess')),auditDays:Number(val('c-ad')),totpCode:val('c-adcode'),geo:val('c-geo'),linkCacheHours:Number(val('c-lc')),loginAllow:$('c-allow').value,
     tg:{token:val('c-tgt'),chat:val('c-tgc'),events:events,clearToken:checked('c-tgclr')},monitor:{enabled:checked('c-mon'),failCount:Number(val('c-fc'))},reportHour:Number(val('c-rh')),trafficAlertGB:Number(val('c-ta'))};
    api('/api/settings',{body:body}).then(function(){toast('已保存');$('c-err').textContent='';boot()}).catch(function(e){$('c-err').textContent=e.message});
   });

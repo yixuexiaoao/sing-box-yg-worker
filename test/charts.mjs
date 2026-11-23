@@ -17,8 +17,24 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,TS,S};})();'), sandbox);
-const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, TS, S } = sandbox.renderers;
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,TS,S};})();'), sandbox);
+const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, fmtTime, localInput, readDateTime, TS, S } = sandbox.renderers;
+
+S.me = { settings: { tz: 'America/New_York' } };
+const utc = Date.parse('2026-03-08T07:30:00Z');
+assert.equal(fmtTime(utc), '2026-03-08 03:30:00');
+assert.equal(localInput(utc), '2026-03-08T03:30');
+elements.date = { value: '2026-03-08T03:30' };
+assert.equal(readDateTime('date'), utc);
+elements.date.value = '2026-03-08T02:30';
+assert.ok(Number.isNaN(readDateTime('date')));
+elements.date.value = '2026-11-01T01:30';
+assert.equal(readDateTime('date'), Date.parse('2026-11-01T05:30:00Z'));
+sandbox.Date = class extends Date { static now() { return Date.parse('2026-03-09T16:00:00Z'); } };
+assert.deepEqual(Array.from(await rangeOf({ range: 'yesterday' })), [Date.parse('2026-03-08T05:00:00Z') / 1000, Date.parse('2026-03-09T04:00:00Z') / 1000]);
+assert.deepEqual(Array.from(await rangeOf({ range: '24h' })), [Date.parse('2026-03-08T16:00:00Z') / 1000, Date.parse('2026-03-09T16:00:00Z') / 1000]);
+delete sandbox.Date;
+S.me = null;
 
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);

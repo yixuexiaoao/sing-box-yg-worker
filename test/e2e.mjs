@@ -39,8 +39,16 @@ const env0 = { ...process.env, SB_DIR: sbDir, SB_WEBDIR: path.join(sbDir, '..', 
 // 拦截公开IP库请求（不访问外网），记录调用次数以验证缓存
 const realFetch = globalThis.fetch;
 let geoCalls = 0, geoAsked = [];
+const reports = [];
 globalThis.fetch = async (u, opt) => {
-  if (String(u).startsWith('https://api.telegram.org/')) throw new Error('mock provider diagnostics');
+  if (String(u).startsWith('https://api.telegram.org/')) {
+    const { text } = JSON.parse(opt.body);
+    if (text.includes('流量日报')) {
+      reports.push(text);
+      return Response.json({ ok: true });
+    }
+    throw new Error('mock provider diagnostics');
+  }
   if (String(u).startsWith('http://ip-api.com/batch')) {
     geoCalls++;
     const ips = JSON.parse(opt.body);
@@ -308,6 +316,15 @@ try {
   check(r.status === 200 && r.body.data.tz === 5.5 && r.body.data.cur.start === r.body.data.prev.end &&
     r.body.data.prev.queryEnd === Math.floor(r.body.data.cur.start / 3600000) * 3600000 &&
     r.body.data.prev.end - r.body.data.prev.queryEnd === 1800000, 'adjacent billing cycles do not overlap an hourly bucket');
+  r = await post('/api/settings', { tz: 'America/New_York' });
+  check(r.status === 200 && (await req('GET', '/api/me')).body.settings.tz === 'America/New_York', 'named panel time zone is saved');
+  r = await post('/api/settings', { tz: 'America/Invalid' });
+  check(r.status === 400 && (await req('GET', '/api/me')).body.settings.tz === 'America/New_York', 'invalid time zone does not overwrite saved zone');
+  const dstCycle = { mode: 'days', len: 1, start: '2026-03-08' };
+  pr = mod.cyclePeriods(dstCycle, Date.parse('2026-03-08T16:00:00Z'), 'America/New_York');
+  check(pr.cur[0] === Date.parse('2026-03-08T05:00:00Z') && pr.cur[1] - pr.cur[0] === 23 * 3600000, 'spring billing day follows the 23-hour local day');
+  pr = mod.cyclePeriods(dstCycle, Date.parse('2026-11-01T16:00:00Z'), 'America/New_York');
+  check(pr.cur[0] === Date.parse('2026-11-01T04:00:00Z') && pr.cur[1] - pr.cur[0] === 25 * 3600000, 'fall billing day follows the 25-hour local day');
   await post('/api/settings', { tz: 8 });
   const backedUpCycle = { mode: 'days', start: '2026-11-01', len: 30, quotaGB: 50, count: 'up', source: 'proxy' };
   r = await post('/api/import', { servers: [{ name: '测试VPS', host: '127.0.0.1', port, path: '/e2epath', token, cycle: backedUpCycle }] });
@@ -555,6 +572,13 @@ try {
   await mod.cronTick(env);
   h = JSON.parse(await env.SBYG_KV.get('health'));
   check(!h[id].down, 'cron marks server recovered');
+
+  await post('/api/settings', { tz: 'America/New_York', reportHour: 2, tg: { events: { daily: true } } });
+  await mod.cronTick(env, Date.parse('2026-03-08T06:55:00Z'));
+  check(reports.length === 0, 'report waits until the scheduled local time');
+  await mod.cronTick(env, Date.parse('2026-03-08T07:00:00Z'));
+  await mod.cronTick(env, Date.parse('2026-03-08T07:05:00Z'));
+  check(reports.length === 1 && reports[0].includes('2026-03-07 流量日报'), 'report follows DST gap and uses the previous local date once');
 
   // ---------- 持有有效会话时，导出（密码校验）与登录共用同一失败计数
   await env.AUTH_STATE._storage.delete('fail:' + fromIp);
