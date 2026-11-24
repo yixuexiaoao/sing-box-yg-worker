@@ -72,6 +72,10 @@ globalThis.fetch = async (u, opt) => {
     ghCacheMode = opt?.cache;
     ghSignal = opt?.signal;
     if (ghUnavailable) return new Response('', { status: 503 });
+    if (f === 'version' && ghTransient > 0) {
+      ghTransient--;
+      return new Response('', { status: 503 });
+    }
     if (ghBadVersion) return new Response('unknown version');
     return new Response(f === 'version' ? 'v99.1更新内容：\n1、新功能A\n2、修复B\n\nv26.1更新内容：\nold' : 'import os\nVERSION = "9.9.9"\n');
   }
@@ -86,7 +90,7 @@ globalThis.fetch = async (u, opt) => {
   return realFetch(u, opt);
 };
 let whoisCalls = 0, ghCalls = 0, ghRange, ghEncoding, ghCacheMode, ghSignal;
-let ghUnavailable = false, ghBadVersion = false, ghReadFailure = false, ghPartial = false;
+let ghUnavailable = false, ghBadVersion = false, ghReadFailure = false, ghPartial = false, ghTransient = 0;
 const agentCopy = path.join(sbDir, '..', 'sbagent_copy.py');
 fs.copyFileSync(agentPy, agentCopy);
 const upFiles = {};
@@ -468,8 +472,13 @@ try {
     ghUnavailable = true;
     r = await req('GET', '/api/latest');
     check(r.status === 200 && r.body.data.stale === true && r.body.data.script === old.script, 'upstream failure retains and marks stale versions');
-    check((await req('GET', '/api/latest?refresh=1')).status === 502, 'manual version refresh reports upstream failure');
+    r = await req('GET', '/api/latest?refresh=1');
+    check(r.status === 200 && r.body.data.stale && r.body.data.refreshError.includes('HTTP 503'),
+      'manual version refresh retains the cache and reports temporary upstream failure');
     ghUnavailable = false;
+    ghTransient = 2;
+    r = await req('GET', '/api/latest?refresh=1');
+    check(r.status === 200 && !r.body.data.stale && ghTransient === 0, 'manual version refresh recovers from temporary 503s');
     ghBadVersion = true;
     r = await req('GET', '/api/latest?refresh=1');
     check(r.status === 502 && JSON.parse(await env.SBYG_KV.get('latest')).script === old.script, 'invalid upstream version does not overwrite cache');
