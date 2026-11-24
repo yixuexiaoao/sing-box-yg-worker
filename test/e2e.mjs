@@ -186,6 +186,9 @@ try {
   check(r.status === 200 && r.body.data.total > 0, 'logs via worker');
   r = await call('traffic', { hours: 24, group: 'ip' });
   check(r.status === 200 && Array.isArray(r.body.data.rows), 'traffic query via worker');
+  r = await call('traffic', { hours: 24, group: 'hour', timeline: true });
+  check(r.status === 200 && Array.isArray(r.body.data.buckets) && r.body.data.rows.length === 0 &&
+    Number.isInteger(r.body.data.nic.sampled), 'Worker forwards UTC traffic series and NIC coverage');
   r = await call('logpolicy', { max_mb: 5, keep: 3, compress: true, retain_days: 7 });
   check(r.status === 200 && r.body.data.keep === 3, 'log policy via worker');
   r = await call('logprune', { start: 0, end: 1 });
@@ -574,6 +577,8 @@ try {
   check(!h[id].down, 'cron marks server recovered');
 
   await post('/api/settings', { tz: 'America/New_York', reportHour: 2, tg: { events: { daily: true } } });
+  // Earlier health checks run on the real clock and may already have sent a report.
+  reports.length = 0;
   await mod.cronTick(env, Date.parse('2026-03-08T06:55:00Z'));
   check(reports.length === 0, 'report waits until the scheduled local time');
   await mod.cronTick(env, Date.parse('2026-03-08T07:00:00Z'));

@@ -17,7 +17,7 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,TS,S};})();'), sandbox);
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,trafficTimeRows,sortTrafficTimes,nicAvailable,TS,S};})();'), sandbox);
 const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, fmtTime, localInput, readDateTime, TS, S } = sandbox.renderers;
 
 S.me = { settings: { tz: 'America/New_York' } };
@@ -35,6 +35,21 @@ assert.deepEqual(Array.from(await rangeOf({ range: 'yesterday' })), [Date.parse(
 assert.deepEqual(Array.from(await rangeOf({ range: '24h' })), [Date.parse('2026-03-08T16:00:00Z') / 1000, Date.parse('2026-03-09T16:00:00Z') / 1000]);
 delete sandbox.Date;
 S.me = null;
+
+const { trafficTimeRows, sortTrafficTimes, nicAvailable } = sandbox.renderers;
+const bucket = (iso, tx = null, rx = null) => ({ t: Date.parse(iso) / 1000, up: 5, down: 10, conns: 1, ips: 1, hosts: 1, tx, rx });
+const hours = [bucket('2026-11-23T15:00Z', 100, 200), bucket('2026-11-23T16:00Z', 0, 0), bucket('2026-11-24T00:00Z')];
+assert.deepEqual(Array.from(sortTrafficTimes(trafficTimeRows(hours, 'hour', 'proxy', 'Asia/Shanghai')), (row) => row.key), ['2026-11-24 08:00', '2026-11-24 00:00', '2026-11-23 23:00']);
+const nicHours = trafficTimeRows(hours, 'hour', 'nic', 'Asia/Shanghai');
+assert.deepEqual(Array.from(nicHours, (row) => [row.up, row.down]), [[100, 200], [0, 0]]);
+assert.equal(nicAvailable({ nic: { rx: 0, tx: 0, sampled: 1 } }), true);
+assert.equal(nicAvailable({ nic: { rx: 0, tx: 0, sampled: 0 } }), false);
+const [partialDay] = trafficTimeRows([bucket('2026-11-23T18:00Z')], 'day', 'proxy', 'Asia/Kolkata');
+assert.equal(partialDay.key, '2026-11-24');
+assert.equal(partialDay.start, Date.parse('2026-11-23T18:00Z') / 1000);
+const overlap = sortTrafficTimes(trafficTimeRows([bucket('2026-11-01T05:00Z'), bucket('2026-11-01T06:00Z')], 'hour', 'proxy', 'America/New_York'));
+assert.deepEqual(Array.from(overlap, (row) => row.key), ['2026-11-01 01:00 UTC-05:00', '2026-11-01 01:00 UTC-04:00']);
+assert.equal(overlap[0].start - overlap[1].start, 3600);
 
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);
@@ -178,4 +193,10 @@ assert.ok(clicked && link.download === 'traffic-day.csv');
 assert.equal(csvUrlReleased, undefined);
 finishDownload();
 assert.equal(csvUrlReleased, 'blob:traffic');
+TS.source = 'nic';
+let nicCsv;
+sandbox.URL.createObjectURL = (blob) => { nicCsv = blob; return 'blob:nic'; };
+exportCsv();
+assert.equal(link.download, 'traffic-nic-day.csv');
+assert.match(await nicCsv.text(), /^server,key,tx,rx,total/);
 console.log('PASS 页面脚本语法、图表、CSV 与转义、内存、周期配额/时区/缺失数据和分组汇总');
