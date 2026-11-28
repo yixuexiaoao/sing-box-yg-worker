@@ -17,7 +17,7 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,trafficTimeRows,sortTrafficTimes,nicAvailable,TS,S};})();'), sandbox);
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,trafficTimeRows,sortTrafficTimes,nicAvailable,serverMatches,groupNames,drawTraffic,parallelReads,TS,S};})();'), sandbox);
 const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, fmtTime, localInput, readDateTime, TS, S } = sandbox.renderers;
 
 S.me = { settings: { tz: 'America/New_York' } };
@@ -50,6 +50,43 @@ assert.equal(partialDay.start, Date.parse('2026-11-23T18:00Z') / 1000);
 const overlap = sortTrafficTimes(trafficTimeRows([bucket('2026-11-01T05:00Z'), bucket('2026-11-01T06:00Z')], 'hour', 'proxy', 'America/New_York'));
 assert.deepEqual(Array.from(overlap, (row) => row.key), ['2026-11-01 01:00 UTC-05:00', '2026-11-01 01:00 UTC-04:00']);
 assert.equal(overlap[0].start - overlap[1].start, 3600);
+
+const { serverMatches, groupNames, drawTraffic, parallelReads } = sandbox.renderers;
+S.servers = [
+  { id: 'a', name: 'Frankfurt VPS', host: '192.0.2.7', group: '欧洲', note: '日常出口' },
+  { id: 'b', name: 'Tokyo VPS', host: '192.0.2.8', group: 'constructor', note: '备用' },
+];
+S.status = { a: { data: { active: true } }, b: { error: '暂不可达' } };
+assert.equal(serverMatches(S.servers[0], ['frankfurt', '日常'], 'running'), true);
+assert.equal(serverMatches(S.servers[1], ['192.0.2.8'], 'offline'), true);
+assert.equal(serverMatches(S.servers[0], ['frankfurt'], 'offline'), false);
+assert.equal(groupNames().find(([name]) => name === 'constructor')[1], 1);
+
+let inFlight = 0, peakReads = 0;
+assert.deepEqual(Array.from(await parallelReads([1, 2, 3, 4, 5, 6, 7, 8], 6, async (n) => {
+  peakReads = Math.max(peakReads, ++inFlight);
+  await Promise.resolve();
+  inFlight--;
+  return n * 2;
+})), [2, 4, 6, 8, 10, 12, 14, 16]);
+assert.equal(peakReads, 6);
+
+for (const id of ['t-sum', 't-srvsum', 't-chart', 't-out', 't-csv', 't-pages', 't-page', 't-prev', 't-next']) {
+  elements[id] = { innerHTML: '', querySelectorAll: () => [] };
+}
+const results = Array.from({ length: 205 }, (_, i) => ({ key: 'host-' + (i + 1), up: 1, down: 0, conns: 1, ips: 1, hosts: 1 }));
+const summary = { tot: { up: 205, down: 0 }, nic: { servers: 0 }, mt: { up: 205, down: 0, conns: 205 },
+  partial: [], errs: [], off: [], total: 205, range: [utc / 1000, utc / 1000 + 3600] };
+drawTraffic(results, { group: 'host' }, S.servers.slice(0, 1), summary);
+assert.equal((elements['t-out'].innerHTML.match(/data-drill=/g) || []).length, 100);
+assert.equal(elements['t-page'].textContent, '1–100 / 205');
+TS.movePage(1);
+assert.ok(elements['t-out'].innerHTML.includes('>host-101</a>'));
+assert.equal(elements['t-page'].textContent, '101–200 / 205');
+TS.movePage(1);
+assert.equal((elements['t-out'].innerHTML.match(/data-drill=/g) || []).length, 5);
+assert.equal(elements['t-next'].disabled, true);
+console.log('PASS server search and status filter, six concurrent reads, 205 traffic rows paginate 100/100/5');
 
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);

@@ -37,7 +37,10 @@ export function memoryKV() {
   };
   return {
     _map: m,
-    async get(k) { const e = alive(k); return e ? e.value : null; },
+    async get(k) {
+      const read = (key) => { const e = alive(key); return e ? e.value : null; };
+      return Array.isArray(k) ? new Map(k.map((key) => [key, read(key)])) : read(k);
+    },
     async put(k, v, opt = {}) { m.set(k, { value: String(v), metadata: opt.metadata, exp: opt.expirationTtl ? Date.now() + opt.expirationTtl * 1000 : 0 }); },
     async delete(k) { m.delete(k); },
     async list({ prefix = '', cursor, limit = 1000 } = {}) {
