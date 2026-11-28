@@ -4,7 +4,7 @@
 // 与服务器通信：cloudflare:sockets 直连 IP:端口，报文 AES-256-CBC + HMAC-SHA256 加密签名，带时间戳与 nonce 防重放
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '1.6.9';
+const VERSION = '1.6.10';
 // 服务器升级以此仓库为准（与 sbagent 内置的升级地址一致）
 const UPSTREAM = 'https://raw.githubusercontent.com/yixuexiaoao/sing-box-yg/main';
 const GB = 1073741824;
@@ -1884,13 +1884,14 @@ const PAGE = `<!doctype html>
 @media (prefers-color-scheme:dark){:root{--bg:#0f1218;--card:#171b23;--fg:#e6e8ec;--muted:#9aa3af;--line:#2a303b;--accent:#3b82f6;--accent-fg:#fff;--ok:#22c55e;--bad:#f87171;--warn:#fbbf24;--chip:#232a35;--code:#11151c;--bar:#2f5bb5}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
-.workspace{display:grid;grid-template-columns:190px minmax(0,1fr);min-height:100vh;align-items:start}
-.app-nav{display:flex;flex-direction:column;gap:18px;padding:18px 12px;background:var(--card);border-right:1px solid var(--line);position:sticky;top:0;z-index:5;height:100vh;overflow:auto}
-.app-brand{min-width:0;padding:0 6px}.app-brand h1{font-size:16px;margin:0;overflow-wrap:anywhere}.app-brand .small{display:block}
-.app-nav nav{display:grid;gap:4px}.app-nav nav button{text-align:left;white-space:nowrap;background:transparent;border-color:transparent}
-.app-nav nav button.on{background:var(--chip);color:var(--accent);border-color:var(--line);font-weight:600}
-.app-nav nav button:hover{border-color:var(--line)}
-.app-nav #b-logout{margin-top:auto;align-self:flex-start;background:transparent}
+.app-header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line)}
+.app-header-inner{max-width:1440px;margin:0 auto;padding:10px 20px;display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:8px 16px}
+.app-brand{min-width:0;display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}.app-brand h1{font-size:16px;margin:0;overflow-wrap:anywhere}
+.app-header nav{display:flex;gap:4px;min-width:0;overflow-x:auto}
+.app-header nav button{flex:none;white-space:nowrap;background:transparent;border-color:transparent}
+.app-header nav button.on{background:var(--chip);color:var(--accent);border-color:var(--line);font-weight:600}
+.app-header nav button:hover{border-color:var(--line)}
+.app-header #b-logout{white-space:nowrap;background:transparent}
 main{min-width:0;width:100%;padding:20px;max-width:1440px;margin:0 auto}
 button,select,input,textarea{font:inherit;color:inherit}
 button{background:var(--chip);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer}
@@ -1969,9 +1970,9 @@ svg text{fill:var(--muted);font-size:10px}
 .chart-column{flex:1;min-width:24px;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;padding:0 3px;position:relative;border:0;border-radius:0;background:transparent}.chart-column:hover,.chart-column:focus-visible{background:var(--chip);outline:2px solid var(--accent);outline-offset:-2px}
 .chart-stack{height:calc(100% - 24px);width:100%;max-width:42px;display:flex;flex-direction:column;justify-content:flex-end}.chart-stack i{display:block;width:100%;flex:none}.chart-label{height:24px;flex:none;font-size:10px;line-height:24px;white-space:nowrap;color:var(--muted)}
 @media (max-width:820px){
- .workspace{display:block}.app-nav{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;height:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px 10px}
- .app-brand{padding:0;display:flex;gap:6px;align-items:baseline}.app-brand .small{flex:none}.app-nav nav{grid-column:1/-1;grid-row:2;display:flex;overflow-x:auto}
- .app-nav #b-logout{grid-column:2;grid-row:1;margin:0;font-size:12px}.app-nav nav button{text-align:center;padding:4px 8px}
+ .app-header-inner{grid-template-columns:minmax(0,1fr) auto;gap:6px;padding:8px 10px}
+ .app-header nav{grid-column:1/-1;grid-row:2}
+ .app-header #b-logout{grid-column:2;grid-row:1;font-size:12px}.app-header nav button{padding:4px 8px}
  .settings-grid{grid-template-columns:minmax(0,1fr);gap:0}
 }
 @media (max-width:600px){.grid{grid-template-columns:minmax(0,1fr)}main{padding:10px}.page-heading h2{font-size:18px}.query-fields,.query-results{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-column:nth-child(even) .chart-label{visibility:hidden}}
@@ -1998,7 +1999,14 @@ function panelZone(){return S.me&&S.me.settings?S.me.settings.tz:8}
 function zoneLabel(tz){return typeof tz==='number'?'UTC'+(tz>=0?'+':'')+tz:tz}
 function fmtTime(t){if(!t||!Number.isFinite(Number(t)))return '-';return new Date(panelClock.wall(Number(t),panelZone())).toISOString().slice(0,19).replace('T',' ')}
 function copy(text){(navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject()).then(function(){toast('已复制')},function(){var t=document.createElement('textarea');t.value=text;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove();toast('已复制')})}
-function srvById(id){for(var i=0;i<S.servers.length;i++)if(S.servers[i].id===id)return S.servers[i]}
+var indexedServers,serverIndex;
+function srvById(id){
+ if(indexedServers!==S.servers){
+  indexedServers=S.servers;
+  serverIndex=new Map(indexedServers.map(function(s){return [s.id,s]}));
+ }
+ return serverIndex.get(id);
+}
 function val(id){var e=$(id);return e?String(e.value).trim():''}
 function checked(id){var e=$(id);return !!(e&&e.checked)}
 function modal(title,html,narrow){closeModal();var m=document.createElement('div');m.className='modal';m.id='modal';
@@ -2065,8 +2073,8 @@ function boot(){
 
 var TABS=[['servers','服务器'],['traffic','流量统计'],['subs','订阅管理'],['audit','审计日志'],['settings','设置']];
 function renderShell(){
- $app.innerHTML='<div class="workspace"><header class="app-nav"><div class="app-brand"><h1>'+esc(S.me.settings.title)+'</h1><span class="muted small">v'+esc(S.me.version)+'</span></div><nav id="nav" aria-label="主导航">'+
- TABS.map(function(t){return '<button type="button" data-tab="'+t[0]+'">'+t[1]+'</button>'}).join('')+'</nav><button id="b-logout">退出</button></header><main id="view"></main></div>';
+ $app.innerHTML='<header class="app-header"><div class="app-header-inner"><div class="app-brand"><h1>'+esc(S.me.settings.title)+'</h1><span class="muted small">v'+esc(S.me.version)+'</span></div><nav id="nav" aria-label="主导航">'+
+ TABS.map(function(t){return '<button type="button" data-tab="'+t[0]+'">'+t[1]+'</button>'}).join('')+'</nav><button id="b-logout">退出</button></div></header><main id="view"></main>';
  bind($('nav'),'[data-tab]',function(b){go(b.getAttribute('data-tab'))});
  $('b-logout').addEventListener('click',function(){api('/api/logout',{body:{}}).then(showLogin)});
 }
@@ -2097,6 +2105,20 @@ function viewServers(){
  $('b-state').value=S.serverState;
  $('b-state').addEventListener('change',function(){S.serverState=val('b-state');renderGrid()});
  $('b-search').addEventListener('input',function(){S.serverSearch=val('b-search');scheduleRender()});
+ var grid=$('grid'),groups=$('gchips');
+ grid.addEventListener('click',function(e){
+  var button=e.target.closest('button[data-act]');
+  if(button&&grid.contains(button))onAction(button.getAttribute('data-act'),button.getAttribute('data-id'));
+ });
+ grid.addEventListener('change',function(e){
+  if(e.target.matches('input[data-sel]'))S.selected[e.target.getAttribute('data-sel')]=e.target.checked;
+ });
+ groups.addEventListener('click',function(e){
+  var button=e.target.closest('button[data-g]');
+  if(!button||!groups.contains(button))return;
+  S.groupFilter=button.hasAttribute('data-all')?null:button.getAttribute('data-g');
+  renderGrid();
+ });
  var nt=[];
  if(S.me&&S.me.weakPassword)nt.push('⚠ 当前面板密码 ADMIN_PASSWORD 少于12位，建议在 Cloudflare 后台改为更长的随机密码，并在「设置 → 安全与审计」开启二次验证。');
  if(S.me&&S.me.secretError)nt.push('⛔ 加密数据无法解密：'+S.me.secretError+'。服务器 Token / TG Token / 二次验证密钥暂不可用（数据未被修改）。请在 Worker 设置中把 DATA_KEY 以「机密(Secret)」恢复为原来的值后刷新；以「文本变量」添加的会在下次 Git/wrangler 部署时被删除。');
@@ -2113,34 +2135,80 @@ function upgradeHint(s,d){if(!needUpgrade(d))return '';var L=S.latest;return '<d
 function visibleServers(){return S.groupFilter==null?S.servers.slice():S.servers.filter(function(s){return (s.group||'')===S.groupFilter})}
 function loadServers(){var pre=PRE;PRE=null;
  return (pre?pre.then(function(j){return j&&j.ok?j:api('/api/servers')}):api('/api/servers')).then(function(j){S.servers=j.data;renderGrid();refreshAll()})}
-var renderPending=false;
+var renderPending=false,renderAllCards=false,changedCards=new Set(),gridCards=new WeakMap();
 // 多台服务器的状态陆续返回时合并为一次重绘。页面在后台/隐藏时浏览器暂停 requestAnimationFrame，
 // 原先卡片会一直停在「加载中」且之后的重绘全部被跳过；现在同时设定时器，哪个先到就由哪个执行
-function scheduleRender(){if(renderPending)return;renderPending=true;var done=false;
- function run(){if(done)return;done=true;renderPending=false;renderGrid()}
- requestAnimationFrame(run);setTimeout(run,100)}
+function scheduleRender(id){
+ if(id===undefined)renderAllCards=true;else changedCards.add(id);
+ if(renderPending)return;
+ renderPending=true;var done=false;
+ function run(){
+  if(done)return;
+  done=true;
+  cancelAnimationFrame(frame);
+  clearTimeout(timer);
+  var all=renderAllCards,ids=changedCards;
+  renderPending=false;renderAllCards=false;changedCards=new Set();
+  if(all)renderGrid();else refreshCards(ids);
+ }
+ var frame=requestAnimationFrame(run),timer=setTimeout(run,100);
+}
+var CARD_FOCUS_ATTRS=['data-act','data-id','data-sel','data-server-details'];
+function cardViewState(root){
+ var details=new Set(Array.from(root.querySelectorAll('details[data-server-details][open]'),function(el){return el.getAttribute('data-server-details')}));
+ var focused=document.activeElement;
+ return {details:details,focus:focused&&root.contains(focused)?CARD_FOCUS_ATTRS.map(function(k){return focused.getAttribute(k)}):null};
+}
+function restoreCardView(root,state){
+ root.querySelectorAll('details[data-server-details]').forEach(function(el){el.open=state.details.has(el.getAttribute('data-server-details'))});
+ if(!state.focus)return;
+ var focus=Array.from(root.querySelectorAll('[data-act],input[data-sel],[data-server-details]>summary')).find(function(el){
+  return CARD_FOCUS_ATTRS.every(function(k,i){return el.getAttribute(k)===state.focus[i]});
+ });
+ if(focus)focus.focus({preventScroll:true});
+}
+function refreshCards(ids){
+ var grid=$('grid');if(!grid)return;
+ var cards=gridCards.get(grid);
+ if(!cards){renderGrid();return}
+ if(S.serverState){
+  var terms=S.serverSearch.toLowerCase().split(/\\s+/).filter(Boolean);
+  var membershipChanged=Array.from(ids).some(function(id){
+   var s=srvById(id),matches=!!s&&(S.groupFilter==null||(s.group||'')===S.groupFilter)&&serverMatches(s,terms,S.serverState);
+   return cards.has(id)!==matches;
+  });
+  if(membershipChanged){renderGrid();return}
+ }
+ ids.forEach(function(id){
+  var card=cards.get(id),s=srvById(id);
+  if(!card||!s)return;
+  var state=cardViewState(card),template=document.createElement('template');
+  template.innerHTML=cardHtml(s);
+  var updated=template.content.firstElementChild;
+  card.replaceWith(updated);
+  cards.set(id,updated);
+  restoreCardView(updated,state);
+ });
+ updateSummary();
+}
 function renderGrid(){
  var g=$('grid');if(!g)return;
- var openDetails={};g.querySelectorAll('details[data-server-details][open]').forEach(function(el){openDetails[el.getAttribute('data-server-details')]=true});
- var focused=document.activeElement,focusAttrs=['data-act','data-id','data-sel','data-server-details'],focusValues=focused&&g.contains(focused)?focusAttrs.map(function(k){return focused.getAttribute(k)}):null;
+ var state=cardViewState(g);
  var groups=groupNames();
  if(S.groupFilter!=null&&!groups.some(function(x){return x[0]===S.groupFilter}))S.groupFilter=null;
- $('gchips').innerHTML=groups.length>1||(groups[0]&&groups[0][0])?'<button data-g="*"'+(S.groupFilter==null?' class="on"':'')+'>全部 ('+S.servers.length+')</button>'+groups.map(function(x){return '<button data-g="'+esc(x[0])+'"'+(S.groupFilter===x[0]?' class="on"':'')+'>'+esc(x[0]||'未分组')+' ('+x[1]+')</button>'}).join(''):'';
- bind($('gchips'),'[data-g]',function(b){var v=b.getAttribute('data-g');S.groupFilter=v==='*'?null:v;renderGrid()});
+ $('gchips').innerHTML=groups.length>1||(groups[0]&&groups[0][0])?'<button data-g="" data-all'+(S.groupFilter==null?' class="on"':'')+'>全部 ('+S.servers.length+')</button>'+groups.map(function(x){return '<button data-g="'+esc(x[0])+'"'+(S.groupFilter===x[0]?' class="on"':'')+'>'+esc(x[0]||'未分组')+' ('+x[1]+')</button>'}).join(''):'';
  var scope=visibleServers(),terms=S.serverSearch.toLowerCase().split(/\\s+/).filter(Boolean);
  var list=scope.filter(function(s){return serverMatches(s,terms,S.serverState)});
  $('b-count').textContent=terms.length||S.serverState?'显示 '+list.length+' / '+scope.length+' 台':'';
- if(!S.servers.length){g.innerHTML='<div class="card muted">还没有服务器。在 VPS 运行 <b>sb</b>，选择 <b>19 → 2</b> 获取对接信息，然后点击「添加服务器」。</div>';updateSummary();return}
- if(!list.length){g.innerHTML='<div class="card muted">没有符合查询条件的服务器。</div>';updateSummary();return}
- if(S.groupFilter==null&&groups.length>1){
+ if(!S.servers.length)g.innerHTML='<div class="card muted">还没有服务器。在 VPS 运行 <b>sb</b>，选择 <b>19 → 2</b> 获取对接信息，然后点击「添加服务器」。</div>';
+ else if(!list.length)g.innerHTML='<div class="card muted">没有符合查询条件的服务器。</div>';
+ else if(S.groupFilter==null&&groups.length>1){
   var results=new Map();
   list.forEach(function(s){var name=s.group||'';if(!results.has(name))results.set(name,[]);results.get(name).push(s)});
   g.innerHTML=groups.map(function(x){var ss=results.get(x[0]);return ss?'<div class="section"><h3>'+esc(x[0]||'未分组')+' <span class="muted small">'+ss.length+' 台</span></h3><div class="grid">'+ss.map(cardHtml).join('')+'</div></div>':''}).join('');
  }else g.innerHTML='<div class="grid">'+list.map(cardHtml).join('')+'</div>';
- g.querySelectorAll('details[data-server-details]').forEach(function(el){el.open=!!openDetails[el.getAttribute('data-server-details')]});
- if(focusValues){var candidates=g.querySelectorAll('[data-act],input[data-sel],[data-server-details]>summary');for(var ci=0;ci<candidates.length;ci++){var candidate=candidates[ci];if(focusAttrs.every(function(k,i){return candidate.getAttribute(k)===focusValues[i]})){candidate.focus({preventScroll:true});break}}}
- bind(g,'[data-act]',function(b){onAction(b.getAttribute('data-act'),b.getAttribute('data-id'))});
- g.querySelectorAll('input[data-sel]').forEach(function(c){c.addEventListener('change',function(){S.selected[c.getAttribute('data-sel')]=c.checked})});
+ gridCards.set(g,new Map(Array.from(g.querySelectorAll('[data-server-card]'),function(card){return [card.getAttribute('data-server-card'),card]})));
+ restoreCardView(g,state);
  updateSummary();
 }
 function updateSummary(){
@@ -2201,7 +2269,7 @@ function cardHtml(s){
   (d.argo&&(d.argo.temp||d.argo.fixed)?'<span>Argo</span><span>'+esc(d.argo.fixed||d.argo.temp)+'</span>':'')+'</div></details>';
  }
  var b=function(act,label,cls){return '<button data-act="'+act+'" data-id="'+esc(s.id)+'"'+(cls?' class="'+cls+'"':'')+'>'+label+'</button>'};
- return '<div class="card server-card"><div class="server-identity"><h3 class="server-head"><input type="checkbox" aria-label="选择 '+esc(s.name)+'" data-sel="'+esc(s.id)+'"'+(S.selected[s.id]?' checked':'')+'>'+esc(s.name)+
+ return '<div class="card server-card" data-server-card="'+esc(s.id)+'"><div class="server-identity"><h3 class="server-head"><input type="checkbox" aria-label="选择 '+esc(s.name)+'" data-sel="'+esc(s.id)+'"'+(S.selected[s.id]?' checked':'')+'>'+esc(s.name)+
  '<span class="chip"><span class="dot '+state[2]+'"></span> '+state[1]+'</span></h3>'+
  '<span class="muted small server-address">'+esc(s.host)+':'+esc(s.port)+(s.group?' · '+esc(s.group):'')+(st&&st.ms?' · '+esc(st.ms)+'ms':'')+'</span></div>'+(s.note?'<p class="server-note">'+esc(s.note)+'</p>':'')+body+
  '<div class="actions server-main-actions">'+b('traffic','查流量','primary')+b('logs','访问日志')+b('links','节点链接')+'</div>'+
@@ -2213,9 +2281,11 @@ var serverRefreshSeq={},fleetRefreshSeq=0;
 function refreshOne(id){var t0=Date.now(),s=srvById(id),seq=(serverRefreshSeq[id]||0)+1;serverRefreshSeq[id]=seq;
  function current(){var latest=srvById(id);return serverRefreshSeq[id]===seq&&latest&&JSON.stringify([latest.host,latest.port,latest.path,latest.cycle])===JSON.stringify([s.host,s.port,s.path,s.cycle])}
  delete S.cycles[id];
- return call(id,'status').then(function(d){if(!current())return;S.status[id]={data:d,ms:Date.now()-t0};scheduleRender();
-  if(s&&s.cycle&&s.cycle.mode!=='off')return api('/api/servers/'+id+'/cycle',{body:{}}).then(function(j){if(current())S.cycles[id]=j.data},function(e){if(current())S.cycles[id]={error:e.message}});
- },function(e){if(current())S.status[id]={error:e.message}}).then(scheduleRender)}
+ return call(id,'status').then(function(d){if(!current())return;S.status[id]={data:d,ms:Date.now()-t0};scheduleRender(id);
+  if(s&&s.cycle&&s.cycle.mode!=='off')return api('/api/servers/'+id+'/cycle',{body:{}}).then(function(j){
+   if(current()){S.cycles[id]=j.data;scheduleRender(id)}
+  },function(e){if(current()){S.cycles[id]={error:e.message};scheduleRender(id)}});
+ },function(e){if(current()){S.status[id]={error:e.message};scheduleRender(id)}})}
 function refreshAll(){
  var seq=++fleetRefreshSeq,list=visibleServers(),button=$('b-refresh');
  if(button){button.disabled=true;button.textContent='刷新中…'}

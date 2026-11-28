@@ -17,7 +17,7 @@ const sandbox = {
   requestAnimationFrame() {},
   setTimeout() {},
 };
-vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,trafficTimeRows,sortTrafficTimes,nicAvailable,serverMatches,groupNames,drawTraffic,parallelReads,TS,S};})();'), sandbox);
+vm.runInNewContext(script.replace(/boot\(\);\s*\}\)\(\);\s*$/, 'globalThis.renderers={chart,serverMetrics,cycleVisual,cycleDate,cardHtml,updateSummary,csvCell,permissionText,refreshOne,rangeOf,loadLatest,releaseNotesHtml,scriptUpgradeComplete,exportCsv,fmtTime,localInput,readDateTime,trafficTimeRows,sortTrafficTimes,nicAvailable,serverMatches,groupNames,drawTraffic,parallelReads,renderGrid,scheduleRender,srvById,TS,S};})();'), sandbox);
 const { chart, serverMetrics, cycleVisual, cycleDate, cardHtml, updateSummary, csvCell, permissionText, refreshOne, rangeOf, loadLatest, releaseNotesHtml, scriptUpgradeComplete, exportCsv, fmtTime, localInput, readDateTime, TS, S } = sandbox.renderers;
 
 S.me = { settings: { tz: 'America/New_York' } };
@@ -87,6 +87,71 @@ TS.movePage(1);
 assert.equal((elements['t-out'].innerHTML.match(/data-drill=/g) || []).length, 5);
 assert.equal(elements['t-next'].disabled, true);
 console.log('PASS server search and status filter, six concurrent reads, 205 traffic rows paginate 100/100/5');
+
+const { renderGrid, scheduleRender, srvById } = sandbox.renderers;
+let nodes = [], fullWrites = 0, replacements = 0, renderFrame;
+function cardNode(id) {
+  const detail = { open: false, getAttribute: () => 'ops:' + id };
+  const button = {
+    getAttribute: (name) => ({ 'data-act': 'refresh', 'data-id': id })[name] ?? null,
+    focus: () => { sandbox.document.activeElement = button; },
+  };
+  const card = {
+    getAttribute: () => id, detail, button,
+    contains: (el) => el === button,
+    querySelectorAll: (selector) => selector.endsWith('[open]') ? (detail.open ? [detail] : []) : selector.startsWith('details') ? [detail] : [button],
+    replaceWith(next) { replacements++; nodes[nodes.indexOf(card)] = next; },
+  };
+  return card;
+}
+const oldTimers = { raf: sandbox.requestAnimationFrame, timeout: sandbox.setTimeout };
+Object.assign(sandbox, {
+  requestAnimationFrame(fn) { renderFrame = fn; },
+  cancelAnimationFrame() {}, setTimeout() {}, clearTimeout() {},
+});
+sandbox.document.createElement = () => ({
+  content: {}, set innerHTML(html) { this.content.firstElementChild = cardNode(/data-server-card="([^"]+)"/.exec(html)[1]); },
+});
+elements.grid = {
+  contains: (el) => nodes.some((node) => node.contains(el)),
+  querySelectorAll: (selector) => selector === '[data-server-card]' ? nodes : nodes.flatMap((node) => node.querySelectorAll(selector)),
+  set innerHTML(html) { fullWrites++; nodes = Array.from(html.matchAll(/data-server-card="([^"]+)"/g), ([, id]) => cardNode(id)); },
+};
+S.servers = Array.from({ length: 100 }, (_, i) => ({ id: 'server-' + i, name: '服务器 ' + i, host: '192.0.2.7' }));
+S.status = Object.fromEntries(S.servers.map((s) => [s.id, { data: { active: true } }]));
+renderGrid();
+const untouched = nodes[19], changed = nodes[18];
+changed.detail.open = true;
+sandbox.document.activeElement = changed.button;
+assert.equal(srvById('server-18'), S.servers[18]);
+S.status['server-18'] = { data: { active: false } };
+scheduleRender('server-18');
+scheduleRender('server-18');
+renderFrame();
+assert.equal(fullWrites, 1);
+assert.equal(replacements, 1);
+assert.equal(nodes[19], untouched);
+assert.notEqual(nodes[18], changed);
+assert.equal(nodes[18].detail.open, true);
+assert.equal(sandbox.document.activeElement, nodes[18].button);
+S.serverState = 'running';
+renderGrid();
+assert.equal(nodes.length, 99);
+S.status['server-18'] = { data: { active: true } };
+scheduleRender('server-18');
+renderFrame();
+assert.equal(fullWrites, 3);
+assert.equal(nodes.length, 100);
+S.serverState = '';
+S.servers = [{ id: 'server-18', name: '更新的名称' }];
+assert.equal(srvById('server-18').name, '更新的名称');
+assert.equal(srvById('server-19'), undefined);
+delete elements.grid;
+delete sandbox.document.activeElement;
+delete sandbox.document.createElement;
+sandbox.requestAnimationFrame = oldTimers.raf;
+sandbox.setTimeout = oldTimers.timeout;
+console.log('PASS one of 100 server cards is replaced on a status update, preserving focus and details; status membership reconciles');
 
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.19' }, { agent: '1.4.6', script: 'v26.11.20' }), false);
 assert.equal(scriptUpgradeComplete({ agent: '1.4.6', script_version: 'v26.11.20' }, { agent: '1.4.6', script: 'v26.11.20' }), true);
